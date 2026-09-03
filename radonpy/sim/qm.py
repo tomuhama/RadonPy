@@ -18,7 +18,7 @@ from .qm_wrapper import QMw
 __version__ = '1.0b2'
 
 
-def assign_charges(mol, charge='RESP', confId=0, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
+def assign_charges(mol, charge='RESP', confId=0, confId_list=None, weights=None, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
     opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO',
     charge_method='HF', charge_basis='6-31G(d)', charge_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'},
     total_charge=None, total_multiplicity=None, **kwargs):
@@ -32,9 +32,14 @@ def assign_charges(mol, charge='RESP', confId=0, opt=True, work_dir=None, tmp_di
         mol: RDKit Mol object
 
     Optional args:
-        charge: Select charge type of gasteiger, RESP, ESP, Mulliken, Lowdin, or zero (str, default:RESP)
-        confID: Target conformer ID (int)
-        opt: Do optimization (boolean)
+        charge: Select charge type of gasteiger, RESP, multi-conformer RESP, ESP, Mulliken, Lowdin, or zero (str, default:RESP).
+            ``multi-conformer RESP`` jointly fits one shared atomic-charge vector to all specified conformers.
+        confId: Target conformer ID (int). ``RESP`` uses only this conformer.
+        confId_list: Ordered list of RDKit conformer IDs used by ``multi-conformer RESP`` (list or tuple).
+        weights: RESP weights in the same order as ``confId_list`` (list or tuple). The upstream RESP package
+            squares each weight when adding a conformer's contribution to the objective function.
+        opt: Do optimization (boolean). ``multi-conformer RESP`` requires pre-optimized conformers and ``opt=False``;
+            optimize them first with :func:`conformation_search` or a similar procedure.
         work_dir: Work directory path (str)
         omp: Num of threads of OpenMP in the quantum chemical calculation (int)
         memory: Using memory in the quantum chemical calculation (int, MB)
@@ -48,7 +53,8 @@ def assign_charges(mol, charge='RESP', confId=0, opt=True, work_dir=None, tmp_di
     Returns:
         boolean
     """
-    flag = calc.assign_charges(mol, charge=charge, confId=confId, opt=opt, work_dir=work_dir, tmp_dir=tmp_dir, log_name=log_name, qm_solver=qm_solver,
+    flag = calc.assign_charges(mol, charge=charge, confId=confId, confId_list=confId_list, weights=weights,
+            opt=opt, work_dir=work_dir, tmp_dir=tmp_dir, log_name=log_name, qm_solver=qm_solver,
             opt_method=opt_method, opt_basis=opt_basis, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm,
             charge_method=charge_method, charge_basis=charge_basis, charge_basis_gen=charge_basis_gen,
             total_charge=total_charge, total_multiplicity=total_multiplicity, **kwargs)

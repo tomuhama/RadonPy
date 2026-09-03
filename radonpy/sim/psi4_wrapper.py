@@ -802,6 +802,231 @@ class Psi4w():
         return charges2[1]
 
 
+    def resp_multi(self, confId_list, weights=None, **kwargs):
+        """
+        Psi4w.resp_multi
+
+        Joint two-stage RESP charge calculation for multiple conformers.
+
+        Args:
+            confId_list: Ordered list or tuple of RDKit conformer IDs. At least two IDs are required.
+
+        Optional args:
+            weights: RESP weights in the same order as ``confId_list``. RESP squares each weight when
+                adding a conformer's contribution to the objective function. The weights are passed
+                through without normalization or transformation.
+
+        Returns:
+            Shared RESP charges (float, ndarray). A NaN array is returned on failure.
+        """
+
+        failed_charges = np.full(self.mol.GetNumAtoms(), np.nan)
+        self.error_flag = False
+
+        if confId_list is None:
+            utils.radon_print('confId_list must be explicitly specified for multi-conformer RESP.', level=2)
+            self.error_flag = True
+            return failed_charges
+        if not isinstance(confId_list, (list, tuple)):
+            utils.radon_print('confId_list must be a list or tuple for multi-conformer RESP.', level=2)
+            self.error_flag = True
+            return failed_charges
+        if len(confId_list) < 2:
+            utils.radon_print('confId_list must contain at least two conformer IDs for multi-conformer RESP.', level=2)
+            self.error_flag = True
+            return failed_charges
+
+        validated_conf_ids = []
+        for conf_id in confId_list:
+            if isinstance(conf_id, (bool, np.bool_)) or not isinstance(conf_id, (int, np.integer)):
+                utils.radon_print('Each conformer ID in confId_list must be an integer (bool is not allowed).', level=2)
+                self.error_flag = True
+                return failed_charges
+            conf_id = int(conf_id)
+            try:
+                self.mol.GetConformer(conf_id)
+            except (ValueError, RuntimeError, OverflowError, IndexError):
+                utils.radon_print('Conformer ID %i in confId_list does not exist.' % conf_id, level=2)
+                self.error_flag = True
+                return failed_charges
+            validated_conf_ids.append(conf_id)
+
+        if len(set(validated_conf_ids)) != len(validated_conf_ids):
+            utils.radon_print('Duplicate conformer IDs are not allowed in confId_list.', level=2)
+            self.error_flag = True
+            return failed_charges
+
+        if weights is None:
+            validated_weights = [1.0] * len(validated_conf_ids)
+        else:
+            if not isinstance(weights, (list, tuple)):
+                utils.radon_print('weights must be a list or tuple for multi-conformer RESP.', level=2)
+                self.error_flag = True
+                return failed_charges
+            if len(weights) != len(validated_conf_ids):
+                utils.radon_print('weights must have the same length as confId_list for multi-conformer RESP.', level=2)
+                self.error_flag = True
+                return failed_charges
+
+            validated_weights = []
+            for weight in weights:
+                try:
+                    weight = float(weight)
+                except (TypeError, ValueError, OverflowError):
+                    utils.radon_print('Each multi-conformer RESP weight must be convertible to float.', level=2)
+                    self.error_flag = True
+                    return failed_charges
+                if not np.isfinite(weight):
+                    utils.radon_print('Each multi-conformer RESP weight must be finite.', level=2)
+                    self.error_flag = True
+                    return failed_charges
+                if weight < 0.0:
+                    utils.radon_print('Multi-conformer RESP weights must not be negative.', level=2)
+                    self.error_flag = True
+                    return failed_charges
+                validated_weights.append(weight)
+
+            if not any(weight > 0.0 for weight in validated_weights):
+                utils.radon_print('At least one multi-conformer RESP weight must be positive.', level=2)
+                self.error_flag = True
+                return failed_charges
+
+        initialized = False
+        charges2_array = None
+        dt1 = datetime.datetime.now()
+        utils.radon_print('Psi4 multi-conformer RESP charge calculation is running...', level=1)
+
+        try:
+            resp_code = getattr(resp.resp, '__code__', None)
+            if LooseVersion(resp.__version__) < LooseVersion('0.8') or (resp_code is not None and resp_code.co_argcount != 2):
+                raise RuntimeError('multi-conformer RESP requires RESP 0.8 or later with the two-argument resp(molecules, options) API.')
+
+            def _new_esp_solve(A, B):                
+                try:
+                    q = np.linalg.solve(A, B)
+                except np.linalg.LinAlgError:
+                    q = np.linalg.lstsq(A, B, rcond=None)[0]
+
+                if np.linalg.cond(A) > 1/np.finfo(A.dtype).eps:
+                    q = np.linalg.lstsq(A, B, rcond=None)[0]
+
+                return q
+
+            resp.espfit.esp_solve = _new_esp_solve
+
+            ptab = Chem.GetPeriodicTable()
+            defv_dict = {ptab.GetElementSymbol(n).upper(): ptab.GetDefaultValence(n) if ptab.GetDefaultValence(n) >= 0 else 0 for n in range(1, 119)}
+            psi4.qcdb.parker._expected_bonds = {**defv_dict, **psi4.qcdb.parker._expected_bonds}
+
+            self._prepare_psi4()
+            initialized = True
+
+            pmols = []
+            for conf_id in validated_conf_ids:
+                pmols.append(self._mol2psi4(confId=conf_id, name='%s_conf%i' % (self.name, conf_id)))
+
+            reference = pmols[0]
+            reference_natom = reference.natom()
+            reference_symbols = [reference.symbol(i) for i in range(reference_natom)]
+            reference_charge = reference.molecular_charge()
+            reference_multiplicity = reference.multiplicity()
+            source_symbols = [atom.GetSymbol() for atom in self.mol.GetAtoms()]
+            if reference_natom != self.mol.GetNumAtoms() or reference_symbols != source_symbols:
+                raise ValueError('The first Psi4 molecule does not preserve the RDKit atom count and element order.')
+            if reference_charge != self.charge or reference_multiplicity != self.multiplicity:
+                raise ValueError('The first Psi4 molecule does not preserve the requested molecular charge and multiplicity.')
+            for order, pmol in enumerate(pmols[1:], start=1):
+                if pmol.natom() != reference_natom:
+                    raise ValueError('Conformer %i has a different atom count in multi-conformer RESP.' % validated_conf_ids[order])
+                if [pmol.symbol(i) for i in range(pmol.natom())] != reference_symbols:
+                    raise ValueError('Conformer %i has a different element order in multi-conformer RESP.' % validated_conf_ids[order])
+                if pmol.molecular_charge() != reference_charge:
+                    raise ValueError('Conformer %i has a different molecular charge in multi-conformer RESP.' % validated_conf_ids[order])
+                if pmol.multiplicity() != reference_multiplicity:
+                    raise ValueError('Conformer %i has a different multiplicity in multi-conformer RESP.' % validated_conf_ids[order])
+
+            log_path = './%s_psi4_multi_resp.log' % self.name
+            self._configure_psi4(output=log_path)
+
+            except_list = set([1, 6, 7, 8, 9, 15, 16, 17])  # H, C, N, O, F, P, S, Cl
+            rvdw_dict = {ptab.GetElementSymbol(n): ptab.GetRvdw(n) for n in range(1, 119) if n not in except_list}
+            rvdw_dict['Br'] = 1.978
+            rvdw_dict['I'] = 2.094
+
+            options = {'VDW_SCALE_FACTORS'  : [1.4, 1.6, 1.8, 2.0],
+                       'VDW_POINT_DENSITY'  : 20.0,
+                       'RESP_A'             : 0.0005,
+                       'RESP_B'             : 0.1,
+                       'RADIUS'             : rvdw_dict,
+                       'VDW_RADII'          : rvdw_dict,
+                       'METHOD_ESP'         : self.method,
+                       'BASIS_ESP'          : 'radonpy_basis',
+                       'WEIGHT'             : validated_weights
+                       }
+
+            utils.radon_print('First stage of multi-conformer RESP charge calculation', level=0)
+            charges1 = resp.resp(pmols, options)
+            charges1_array = np.asarray(charges1, dtype=float)
+            if charges1_array.ndim != 2 or charges1_array.shape[0] < 2 or charges1_array.shape[1] != reference_natom:
+                raise ValueError('First-stage multi-conformer RESP returned an invalid charge array.')
+            if not np.all(np.isfinite(charges1_array)):
+                raise ValueError('First-stage multi-conformer RESP returned non-finite charges.')
+
+            resp.stage2_helper.set_stage2_constraint(reference, charges1[1], options)
+            options['RESP_A'] = 0.001
+            options['RADIUS'] = {}
+            options['grid'] = [
+                './%i_%s_grid.dat' % (i + 1, pmol.name())
+                for i, pmol in enumerate(pmols)
+            ]
+            options['esp'] = [
+                './%i_%s_grid_esp.dat' % (i + 1, pmol.name())
+                for i, pmol in enumerate(pmols)
+            ]
+            for path in options['grid'] + options['esp']:
+                if not os.path.isfile(path):
+                    raise FileNotFoundError('Required multi-conformer RESP grid/ESP file is missing: %s' % path)
+
+            utils.radon_print('Second stage of multi-conformer RESP charge calculation', level=0)
+            psi4.core.set_output_file(log_path, True)
+            charges2 = resp.resp(pmols, options)
+            charges2_array = np.asarray(charges2, dtype=float)
+            if charges2_array.ndim != 2 or charges2_array.shape[0] < 2 or charges2_array.shape[1] != reference_natom:
+                raise ValueError('Second-stage multi-conformer RESP returned an invalid charge array.')
+            if not np.all(np.isfinite(charges2_array)):
+                raise ValueError('Second-stage multi-conformer RESP returned non-finite charges.')
+
+            dt2 = datetime.datetime.now()
+            utils.radon_print('Normal termination of psi4 multi-conformer RESP charge calculation. Elapsed time = %s' % str(dt2-dt1), level=1)
+
+        except psi4.SCFConvergenceError as e:
+            self.error_flag = True
+            utils.radon_print('Psi4 SCF convergence error in multi-conformer RESP. %s' % e, level=2)
+
+        except BaseException as e:
+            self.error_flag = True
+            utils.radon_print('Error termination of psi4 multi-conformer RESP charge calculation. %s' % e, level=2)
+
+        finally:
+            if initialized:
+                try:
+                    self._fin_psi4()
+                except BaseException as e:
+                    self.error_flag = True
+                    utils.radon_print('Error while finalizing psi4 multi-conformer RESP calculation. %s' % e, level=2)
+
+        if self.error_flag or charges2_array is None:
+            return failed_charges
+
+        esp_charges = charges2_array[0].copy()
+        resp_charges = charges2_array[1].copy()
+        for i, atom in enumerate(self.mol.GetAtoms()):
+            atom.SetDoubleProp('ESP', esp_charges[i])
+            atom.SetDoubleProp('RESP', resp_charges[i])
+
+        return resp_charges
+
+
     def mulliken_charge(self, recalc=False, **kwargs):
         """
         Psi4w.mulliken_charge

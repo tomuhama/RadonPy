@@ -346,7 +346,7 @@ def get_num_radicals(mol):
     return nr
 
 
-def assign_charges(mol, charge='gasteiger', confId=0, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
+def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=None, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
     opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', opt_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'}, 
     geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO',
     charge_method='HF', charge_basis='6-31G(d)', charge_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'},
@@ -360,9 +360,14 @@ def assign_charges(mol, charge='gasteiger', confId=0, opt=True, work_dir=None, t
         mol: RDKit Mol object
 
     Optional args:
-        charge: Select charge type of gasteiger, RESP, ESP, Mulliken, Lowdin, or zero (str, deffault:gasteiger)
-        confID: Target conformer ID (int)
-        opt: Do optimization (boolean)
+        charge: Select charge type of gasteiger, RESP, multi-conformer RESP, ESP, Mulliken, Lowdin, or zero (str, deffault:gasteiger).
+            ``multi-conformer RESP`` jointly fits one shared atomic-charge vector to all specified conformers.
+        confId: Target conformer ID (int). ``RESP`` uses only this conformer.
+        confId_list: Ordered list of RDKit conformer IDs used by ``multi-conformer RESP`` (list or tuple).
+        weights: RESP weights in the same order as ``confId_list`` (list or tuple). The upstream RESP package
+            squares each weight when adding a conformer's contribution to the objective function.
+        opt: Do optimization (boolean). ``multi-conformer RESP`` requires pre-optimized conformers and ``opt=False``;
+            optimize them first with ``qm.conformation_search()`` or a similar procedure.
         work_dir: Work directory path (str)
         omp: Num of threads of OpenMP in the quantum chemical calculation (int)
         memory: Using memory in the quantum chemical calculation (int, MB)
@@ -385,6 +390,100 @@ def assign_charges(mol, charge='gasteiger', confId=0, opt=True, work_dir=None, t
         Chem.rdPartialCharges.ComputeGasteigerCharges(mol)
         for p in mol.GetAtoms():
             p.SetDoubleProp('AtomicCharge', float(p.GetProp('_GasteigerCharge')))
+
+    elif charge == 'multi-conformer RESP':
+        if not qm_avail:
+            utils.radon_print('Cannot import psi4_wrapper. You can use psi4_wrapper by "conda install -c psi4 psi4 resp dftd3"', level=2)
+            return False
+
+        if opt:
+            utils.radon_print(
+                'Geometry optimization is not supported during multi-conformer RESP. '
+                'Optimize the conformers first with qm.conformation_search() or a similar procedure, then call assign_charges with opt=False.',
+                level=2,
+            )
+            return False
+
+        if not isinstance(qm_solver, str) or qm_solver.lower() != 'psi4':
+            utils.radon_print('multi-conformer RESP is supported only with qm_solver="psi4".', level=2)
+            return False
+
+        if confId_list is None:
+            utils.radon_print('confId_list must be explicitly specified for multi-conformer RESP.', level=2)
+            return False
+        if not isinstance(confId_list, (list, tuple)):
+            utils.radon_print('confId_list must be a list or tuple for multi-conformer RESP.', level=2)
+            return False
+        if len(confId_list) < 2:
+            utils.radon_print('confId_list must contain at least two conformer IDs for multi-conformer RESP.', level=2)
+            return False
+
+        validated_conf_ids = []
+        for conf_id in confId_list:
+            if isinstance(conf_id, (bool, np.bool_)) or not isinstance(conf_id, (int, np.integer)):
+                utils.radon_print('Each conformer ID in confId_list must be an integer (bool is not allowed).', level=2)
+                return False
+            conf_id = int(conf_id)
+            try:
+                mol.GetConformer(conf_id)
+            except (ValueError, RuntimeError, OverflowError, IndexError):
+                utils.radon_print('Conformer ID %i in confId_list does not exist.' % conf_id, level=2)
+                return False
+            validated_conf_ids.append(conf_id)
+
+        if len(set(validated_conf_ids)) != len(validated_conf_ids):
+            utils.radon_print('Duplicate conformer IDs are not allowed in confId_list.', level=2)
+            return False
+
+        if weights is None:
+            validated_weights = [1.0] * len(validated_conf_ids)
+        else:
+            if not isinstance(weights, (list, tuple)):
+                utils.radon_print('weights must be a list or tuple for multi-conformer RESP.', level=2)
+                return False
+            if len(weights) != len(validated_conf_ids):
+                utils.radon_print('weights must have the same length as confId_list for multi-conformer RESP.', level=2)
+                return False
+
+            validated_weights = []
+            for weight in weights:
+                try:
+                    weight = float(weight)
+                except (TypeError, ValueError, OverflowError):
+                    utils.radon_print('Each multi-conformer RESP weight must be convertible to float.', level=2)
+                    return False
+                if not np.isfinite(weight):
+                    utils.radon_print('Each multi-conformer RESP weight must be finite.', level=2)
+                    return False
+                if weight < 0.0:
+                    utils.radon_print('Multi-conformer RESP weights must not be negative.', level=2)
+                    return False
+                validated_weights.append(weight)
+
+            if not any(weight > 0.0 for weight in validated_weights):
+                utils.radon_print('At least one multi-conformer RESP weight must be positive.', level=2)
+                return False
+
+        if type(total_charge) is int:
+            kwargs['charge'] = total_charge
+        if type(total_multiplicity) is int:
+            kwargs['multiplicity'] = total_multiplicity
+
+        psi4mol = QMw(mol, confId=confId, work_dir=work_dir, tmp_dir=tmp_dir, qm_solver=qm_solver, method=charge_method, basis=charge_basis,
+                        basis_gen=charge_basis_gen, name=log_name, **kwargs)
+        psi4mol.resp_multi(validated_conf_ids, weights=validated_weights)
+        if psi4mol.error_flag:
+            return False
+
+        resp_charges = [atom.GetDoubleProp('RESP') for atom in psi4mol.mol.GetAtoms()]
+        esp_charges = [atom.GetDoubleProp('ESP') for atom in psi4mol.mol.GetAtoms()]
+        for i, atom in enumerate(mol.GetAtoms()):
+            atom.SetDoubleProp('RESP', resp_charges[i])
+            atom.SetDoubleProp('ESP', esp_charges[i])
+            atom.SetDoubleProp('AtomicCharge', resp_charges[i])
+
+        del psi4mol
+        gc.collect()
 
     elif charge in ['RESP', 'ESP', 'Mulliken', 'Lowdin']:
         if not qm_avail:
