@@ -105,7 +105,15 @@ class Psi4w():
         return psi4.__version__
 
 
-    def _init_psi4(self, *args, output=None):
+    def _prepare_psi4(self):
+        """
+        Psi4w._prepare_psi4
+
+        Prepare the global Psi4 environment and scratch directory.
+
+        This method modifies the global state of Psi4, QCEngine, and the
+        PSI_SCRATCH environment variable.
+        """
 
         # Avoiding errors on Fugaku and in mpi4py
         if LooseVersion(psi4.__version__) >= LooseVersion('1.4'):
@@ -115,7 +123,17 @@ class Psi4w():
         os.environ['PSI_SCRATCH'] = os.path.abspath(self.tmp_dir)
         psi4.core.IOManager.shared_object().set_default_path(os.path.abspath(self.tmp_dir))
 
-        pmol = self._mol2psi4(*args)
+    def _configure_psi4(self, output=None):
+        """
+        Psi4w._configure_psi4
+
+        Configure the global Psi4 calculation settings and output file.
+
+        This method modifies the global state of Psi4 and changes the current
+        working directory to ``self.work_dir``. If output is None, the Psi4
+        output file is not changed.
+        """
+
         self.error_flag = False
         self._basis_set_construction()
         psi4.set_num_threads(self.num_threads)
@@ -142,6 +160,11 @@ class Psi4w():
         if output is not None:
             psi4.core.set_output_file(output, False)
 
+    def _init_psi4(self, *args, output=None):
+        self._prepare_psi4()
+        pmol = self._mol2psi4(*args)
+        self._configure_psi4(output=output)
+
         return pmol
 
     def _fin_psi4(self):
@@ -159,27 +182,34 @@ class Psi4w():
         gc.collect()
 
 
-    def _mol2psi4(self, *args):
+    def _mol2psi4(self, *args, confId=None, name=None):
         """
         Psi4w._mol2psi4
 
-        Convert RDkit Mol object to Psi4 Mol object
+        Convert an RDKit Mol conformer to a Psi4 Molecule object.
+
+        Optional args:
+            confId: Conformer ID. If None, use self.confId
+            name: Psi4 Molecule name. If None, use self.name
 
         Returns:
-            Psi4 Mol object
+            psi4.core.Molecule object
         """
+
+        selected_conf_id = self.confId if confId is None else confId
+        selected_name = self.name if name is None else name
 
         geom = '%i   %i\n' % (self.charge, self.multiplicity)
         for arg in args:
             geom += '%s\n' % (arg)
 
-        coord = np.array(self.mol.GetConformer(int(self.confId)).GetPositions())
+        coord = np.array(self.mol.GetConformer(int(selected_conf_id)).GetPositions())
         for i in range(self.mol.GetNumAtoms()):
             geom += '%2s  % .8f  % .8f  % .8f\n' % (self.mol.GetAtomWithIdx(i).GetSymbol(), coord[i, 0], coord[i, 1], coord[i, 2])
 
         pmol = psi4.geometry(geom)
         pmol.update_geometry()
-        pmol.set_name(self.name)
+        pmol.set_name(selected_name)
 
         return pmol
 
