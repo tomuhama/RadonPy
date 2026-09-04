@@ -802,7 +802,7 @@ class Psi4w():
         return charges2[1]
 
 
-    def resp_multi(self, confId_list, weights=None, **kwargs):
+    def resp_multi(self, confId_list, weights=None, resp_options=None, **kwargs):
         """
         Psi4w.resp_multi
 
@@ -815,6 +815,8 @@ class Psi4w():
             weights: RESP weights in the same order as ``confId_list``. RESP squares each weight when
                 adding a conformer's contribution to the objective function. The weights are passed
                 through without normalization or transformation.
+            resp_options: Additional options passed to the RESP package. These override the
+                RadonPy defaults, except for ``WEIGHT`` which is always taken from ``weights``.
 
         Returns:
             Shared RESP charges (float, ndarray). A NaN array is returned on failure.
@@ -891,6 +893,11 @@ class Psi4w():
                 self.error_flag = True
                 return failed_charges
 
+        if resp_options is not None and not isinstance(resp_options, dict):
+            utils.radon_print('resp_options must be a dictionary for multi-conformer RESP.', level=2)
+            self.error_flag = True
+            return failed_charges
+
         initialized = False
         charges2_array = None
         dt1 = datetime.datetime.now()
@@ -963,6 +970,14 @@ class Psi4w():
                        'BASIS_ESP'          : 'radonpy_basis',
                        'WEIGHT'             : validated_weights
                        }
+            if resp_options is not None:
+                for option_name, option_value in resp_options.items():
+                    if isinstance(option_name, str) and option_name.upper() == 'WEIGHT':
+                        continue
+                    options[option_name] = option_value
+            # The weights argument is the single source of truth for conformer
+            # weights, even if a caller supplies WEIGHT in resp_options.
+            options['WEIGHT'] = validated_weights
 
             utils.radon_print('First stage of multi-conformer RESP charge calculation', level=0)
             charges1 = resp.resp(pmols, options)

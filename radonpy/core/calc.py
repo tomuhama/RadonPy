@@ -350,7 +350,7 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
     opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', opt_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'}, 
     geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO',
     charge_method='HF', charge_basis='6-31G(d)', charge_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'},
-    total_charge=None, total_multiplicity=None, **kwargs):
+    total_charge=None, total_multiplicity=None, resp_options=None, **kwargs):
     """
     calc.assign_charges
 
@@ -366,6 +366,7 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
         confId_list: Ordered list of RDKit conformer IDs used by ``multi-conformer RESP`` (list or tuple).
         weights: RESP weights in the same order as ``confId_list`` (list or tuple). The upstream RESP package
             squares each weight when adding a conformer's contribution to the objective function.
+        resp_options: Additional options passed to RESP for ``multi-conformer RESP`` (dict, optional).
         opt: Do optimization (boolean). ``multi-conformer RESP`` requires pre-optimized conformers and ``opt=False``;
             optimize them first with ``qm.conformation_search()`` or a similar procedure.
         work_dir: Work directory path (str)
@@ -464,6 +465,10 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
                 utils.radon_print('At least one multi-conformer RESP weight must be positive.', level=2)
                 return False
 
+        if resp_options is not None and not isinstance(resp_options, dict):
+            utils.radon_print('resp_options must be a dictionary for multi-conformer RESP.', level=2)
+            return False
+
         if type(total_charge) is int:
             kwargs['charge'] = total_charge
         if type(total_multiplicity) is int:
@@ -471,7 +476,10 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
 
         psi4mol = QMw(mol, confId=confId, work_dir=work_dir, tmp_dir=tmp_dir, qm_solver=qm_solver, method=charge_method, basis=charge_basis,
                         basis_gen=charge_basis_gen, name=log_name, **kwargs)
-        psi4mol.resp_multi(validated_conf_ids, weights=validated_weights)
+        if resp_options is None:
+            psi4mol.resp_multi(validated_conf_ids, weights=validated_weights)
+        else:
+            psi4mol.resp_multi(validated_conf_ids, weights=validated_weights, resp_options=resp_options)
         if psi4mol.error_flag:
             return False
 
@@ -1496,4 +1504,3 @@ def energy_mm(mol, diele=1.0, coord=None, confId=0, **kwargs):
     energy = energy_bond + energy_angle + energy_dihedral + energy_improper + energy_coulomb + energy_lj
     
     return energy, energy_bond, energy_angle, energy_dihedral, energy_improper, energy_coulomb, energy_lj
-

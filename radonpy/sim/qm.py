@@ -21,7 +21,7 @@ __version__ = '1.0b2'
 def assign_charges(mol, charge='RESP', confId=0, confId_list=None, weights=None, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
     opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO',
     charge_method='HF', charge_basis='6-31G(d)', charge_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'},
-    total_charge=None, total_multiplicity=None, **kwargs):
+    total_charge=None, total_multiplicity=None, resp_options=None, **kwargs):
     """
     sim.qm.assign_charges
 
@@ -38,6 +38,7 @@ def assign_charges(mol, charge='RESP', confId=0, confId_list=None, weights=None,
         confId_list: Ordered list of RDKit conformer IDs used by ``multi-conformer RESP`` (list or tuple).
         weights: RESP weights in the same order as ``confId_list`` (list or tuple). The upstream RESP package
             squares each weight when adding a conformer's contribution to the objective function.
+        resp_options: Additional options passed to RESP for ``multi-conformer RESP`` (dict, optional).
         opt: Do optimization (boolean). ``multi-conformer RESP`` requires pre-optimized conformers and ``opt=False``;
             optimize them first with :func:`conformation_search` or a similar procedure.
         work_dir: Work directory path (str)
@@ -53,7 +54,7 @@ def assign_charges(mol, charge='RESP', confId=0, confId_list=None, weights=None,
     Returns:
         boolean
     """
-    flag = calc.assign_charges(mol, charge=charge, confId=confId, confId_list=confId_list, weights=weights,
+    flag = calc.assign_charges(mol, charge=charge, confId=confId, confId_list=confId_list, weights=weights, resp_options=resp_options,
             opt=opt, work_dir=work_dir, tmp_dir=tmp_dir, log_name=log_name, qm_solver=qm_solver,
             opt_method=opt_method, opt_basis=opt_basis, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm,
             charge_method=charge_method, charge_basis=charge_basis, charge_basis_gen=charge_basis_gen,
