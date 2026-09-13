@@ -10,11 +10,14 @@ import numpy as np
 import pandas as pd
 import re
 import os
+import json
+import operator
 from copy import copy
 import itertools
 import datetime
 import multiprocessing as MP
 import concurrent.futures as confu
+from typing import Sequence, Tuple
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
 from rdkit import Geometry as Geom
@@ -23,6 +26,12 @@ from . import calc, const, utils
 from ..ff.gaff2_mod import GAFF2_mod
 
 __version__ = '1.0b2'
+
+
+RU_ATOM_INDEX_PROP = '_RadonPyRUAtomIndex'
+RU_INSTANCE_PROP = '_RadonPyRUInstance'
+LINKER_ROLE_PROP = '_RadonPyLinkerRole'
+RU_MAPPING_SCHEMA_VERSION = 1
 
 MD_avail = True
 try:
@@ -358,17 +367,18 @@ def combine_mols(mol1, mol2, res_name_1='RU0', res_name_2='RU0'):
 # Polymer chain generator (non random walk)
 ##########################################################
 def simple_polymerization(mols, m_idx, chi_inv, start_num=0, init_poly=None, headhead=False, confId=0,
-                bond_length=1.5, dihedral=np.pi, random_rot=False, dih_type='monomer', res_name_1='RU0', res_name_2=None):
+                bond_length=1.5, dihedral=np.pi, random_rot=False, dih_type='monomer', res_name_1='RU0', res_name_2=None,
+                label=1):
     mols_copy = []
     mols_inv = []
     poly = None
 
     if type(init_poly) == Chem.Mol:
         poly = utils.deepcopy_mol(init_poly)
-        set_linker_flag(poly)
+        set_linker_flag(poly, label=label)
 
     for mol in mols:
-        set_linker_flag(mol)
+        set_linker_flag(mol, label=label)
         mols_copy.append(utils.deepcopy_mol(mol))
         mols_inv.append(calc.mirror_inversion_mol(mol))
 
@@ -411,6 +421,324 @@ def polymerize_mols(mol, n, init_poly=None, headhead=False, confId=0, tacticity=
     utils.radon_print('Normal termination of poly.polymerize_mols. Elapsed time = %s' % str(dt2-dt1), level=1)
 
     return poly
+
+
+def _mapped_unit_atoms(mol, unit_index):
+    """Return ``{repeating-unit atom ID: current atom index}`` from provenance."""
+
+    mapped = {}
+    for atom in mol.GetAtoms():
+        if not atom.HasProp(RU_INSTANCE_PROP) or atom.GetIntProp(RU_INSTANCE_PROP) != unit_index:
+            continue
+        if not atom.HasProp(RU_ATOM_INDEX_PROP):
+            raise ValueError('Oligomer atom provenance is incomplete.')
+        source_id = atom.GetIntProp(RU_ATOM_INDEX_PROP)
+        if source_id in mapped:
+            raise ValueError('Oligomer atom provenance contains a duplicate source atom ID.')
+        mapped[source_id] = atom.GetIdx()
+    return mapped
+
+
+def _validate_repeat_atom_match(
+        repeat_mol, oligomer_mol, source_id, oligomer_idx, linker_source_ids):
+    """Validate one provenance match without using a substructure search."""
+
+    repeat_atom = repeat_mol.GetAtomWithIdx(source_id)
+    oligomer_atom = oligomer_mol.GetAtomWithIdx(oligomer_idx)
+    repeat_identity = (repeat_atom.GetAtomicNum(), repeat_atom.GetIsotope(), repeat_atom.GetFormalCharge())
+    oligomer_identity = (oligomer_atom.GetAtomicNum(), oligomer_atom.GetIsotope(), oligomer_atom.GetFormalCharge())
+    if repeat_identity != oligomer_identity:
+        raise ValueError('Mapped repeating-unit atom identity does not match the oligomer provenance.')
+
+    repeat_bonds = []
+    for bond in repeat_atom.GetBonds():
+        neighbor = bond.GetOtherAtom(repeat_atom)
+        neighbor_source_id = neighbor.GetIntProp(RU_ATOM_INDEX_PROP)
+        if neighbor_source_id not in linker_source_ids:
+            repeat_bonds.append((neighbor_source_id, bond.GetBondTypeAsDouble()))
+    repeat_bonds.sort()
+
+    oligomer_bonds = []
+    oligomer_unit_index = oligomer_atom.GetIntProp(RU_INSTANCE_PROP)
+    for bond in oligomer_atom.GetBonds():
+        neighbor = bond.GetOtherAtom(oligomer_atom)
+        if neighbor.HasProp(RU_INSTANCE_PROP) \
+                and neighbor.GetIntProp(RU_INSTANCE_PROP) == oligomer_unit_index:
+            oligomer_bonds.append((
+                neighbor.GetIntProp(RU_ATOM_INDEX_PROP),
+                bond.GetBondTypeAsDouble(),
+            ))
+    oligomer_bonds.sort()
+    if repeat_bonds != oligomer_bonds or repeat_atom.GetDegree() != oligomer_atom.GetDegree():
+        raise ValueError('Mapped repeating-unit atom has incompatible local bonding in the oligomer.')
+
+
+def build_mapped_oligomer(psmiles: str, n: int = 3, terminal: str = 'H', label: int = 1,
+        tacticity: str = 'isotactic', random_seed: int = 0) -> Tuple[Chem.Mol, Chem.Mol]:
+    """Build an odd, H-capped linear homooligomer with atom provenance.
+
+    Conformers generated later describe conformational averaging only; an
+    atactic ``unit_orientation`` is one fixed stereosequence, not a
+    stereosequence ensemble.
+
+    Args:
+        psmiles: Connected homopolymer PSMILES with two matching linkers.
+        n: Odd number of repeating units, at least three.
+        terminal: Terminal cap mode. Only ``'H'`` is currently supported.
+        label: RadonPy linker label used by :func:`connect_mols`.
+        tacticity: ``'isotactic'`` or a seeded ``'atactic'`` sequence.
+        random_seed: Seed for the atactic unit-orientation sequence.
+
+    Returns:
+        The repeating-unit template and mapped oligomer as a two-item tuple.
+    """
+
+    # Validate workflow inputs before RDKit starts constructing molecules.
+    if not psmiles or '.' in psmiles:
+        raise ValueError('psmiles must be a parseable, connected single-component structure.')
+    if isinstance(n, (bool, np.bool_)):
+        raise TypeError('n must be an integer (bool is not allowed).')
+    n = operator.index(n)
+    if n < 3 or n % 2 == 0:
+        raise ValueError('n must be an odd integer greater than or equal to 3.')
+    label = operator.index(label)
+    random_seed = operator.index(random_seed)
+    if terminal != 'H':
+        raise ValueError("Only terminal='H' is supported by build_mapped_oligomer().")
+    if tacticity not in ('isotactic', 'atactic'):
+        raise ValueError("tacticity must be 'isotactic' or 'atactic'.")
+
+    try:
+        repeat = utils.mol_from_smiles(psmiles)
+    except Exception as e:
+        raise ValueError('psmiles must be a parseable, connected single-component structure.') from e
+    if repeat is None or len(Chem.GetMolFrags(repeat)) != 1:
+        raise ValueError('psmiles must be a parseable, connected single-component structure.')
+
+    # The repeat template must contain exactly the two requested linkers.
+    all_linker_atoms = [
+        atom for atom in repeat.GetAtoms()
+        if atom.GetSymbol() == 'H' and atom.GetIsotope() >= 3
+    ]
+    target_linker_atoms = [
+        atom for atom in all_linker_atoms
+        if atom.GetIsotope() == label + 2
+    ]
+    if len(all_linker_atoms) != 2 or len(target_linker_atoms) != 2:
+        raise ValueError('Exactly two connection points with the requested label are required.')
+    if any(atom.GetDegree() != 1 for atom in target_linker_atoms):
+        raise ValueError('Each connection point must have degree 1.')
+    if any(atom.GetBonds()[0].GetBondType() != Chem.rdchem.BondType.SINGLE for atom in target_linker_atoms):
+        raise ValueError('Only single connection bonds are supported.')
+
+    linker_source_ids = [atom.GetIdx() for atom in target_linker_atoms]
+    for atom in repeat.GetAtoms():
+        atom.SetIntProp(RU_ATOM_INDEX_PROP, atom.GetIdx())
+        atom.SetIntProp(RU_INSTANCE_PROP, -1)
+        atom.SetProp(LINKER_ROLE_PROP, 'none')
+    repeat.GetAtomWithIdx(linker_source_ids[0]).SetProp(LINKER_ROLE_PROP, 'head')
+    repeat.GetAtomWithIdx(linker_source_ids[1]).SetProp(LINKER_ROLE_PROP, 'tail')
+    if not set_linker_flag(repeat, label=label):
+        raise ValueError('Could not initialize the two requested connection points.')
+
+    if tacticity == 'isotactic':
+        unit_orientations = [False] * n
+    else:
+        rng = np.random.default_rng(random_seed)
+        unit_orientations = [bool(value) for value in rng.integers(0, 2, size=n)]
+
+    oligomer = simple_polymerization(
+        [repeat], [0] * n, unit_orientations, label=label
+    )
+    for atom in oligomer.GetAtoms():
+        atom.SetIntProp(
+            RU_INSTANCE_PROP,
+            atom.GetPDBResidueInfo().GetResidueNumber() - 1,
+        )
+
+    # Validate the finished topology before exposing its central-unit mapping.
+    unit_indices = {
+        atom.GetIntProp(RU_INSTANCE_PROP)
+        for atom in oligomer.GetAtoms() if atom.HasProp(RU_INSTANCE_PROP)
+    }
+    if unit_indices != set(range(n)):
+        raise ValueError('The constructed oligomer does not contain the requested repeating units.')
+    junction_bonds = [
+        bond for bond in oligomer.GetBonds()
+        if bond.HasProp('new_bond') and bond.GetBoolProp('new_bond')
+    ]
+    if len(junction_bonds) != n - 1:
+        raise ValueError('The constructed oligomer has an invalid number of unit junctions.')
+
+    outer_linker_indices = [
+        atom.GetIdx() for atom in oligomer.GetAtoms()
+        if atom.HasProp(LINKER_ROLE_PROP) and atom.GetProp(LINKER_ROLE_PROP) in ('head', 'tail')
+    ]
+    if len(outer_linker_indices) != 2:
+        raise ValueError('An H-capped oligomer must retain exactly two outer linker atoms.')
+
+    center_unit_index = n // 2
+    center_mapping = _mapped_unit_atoms(oligomer, center_unit_index)
+    non_linker_source_ids = [
+        atom.GetIdx() for atom in repeat.GetAtoms()
+        if atom.GetIdx() not in linker_source_ids
+    ]
+    if set(center_mapping) != set(non_linker_source_ids):
+        raise ValueError('Central-unit provenance must contain every non-linker atom exactly once.')
+    center_boundary_bonds = [
+        bond for bond in oligomer.GetBonds()
+        if bond.GetBeginAtom().HasProp(RU_INSTANCE_PROP)
+        and bond.GetEndAtom().HasProp(RU_INSTANCE_PROP)
+        and center_unit_index in (
+            bond.GetBeginAtom().GetIntProp(RU_INSTANCE_PROP),
+            bond.GetEndAtom().GetIntProp(RU_INSTANCE_PROP),
+        )
+        and bond.GetBeginAtom().GetIntProp(RU_INSTANCE_PROP) != bond.GetEndAtom().GetIntProp(RU_INSTANCE_PROP)
+    ]
+    if len(center_boundary_bonds) != 2:
+        raise ValueError('The central repeating unit must have two neighboring-unit boundary bonds.')
+    for source_id, oligomer_idx in center_mapping.items():
+        _validate_repeat_atom_match(
+            repeat, oligomer, source_id, oligomer_idx, set(linker_source_ids)
+        )
+
+    repeat.SetProp('_RadonPyOriginalPSMILES', psmiles)
+    repeat.SetIntProp('_RadonPyMappingSchemaVersion', RU_MAPPING_SCHEMA_VERSION)
+    oligomer.SetProp('_RadonPyOriginalPSMILES', psmiles)
+    oligomer.SetIntProp('_RadonPyOligomerN', n)
+    oligomer.SetIntProp('_RadonPyCenterUnitIndex', center_unit_index)
+    oligomer.SetProp('_RadonPyTerminal', terminal)
+    oligomer.SetIntProp('_RadonPyLinkerLabel', label)
+    oligomer.SetProp('_RadonPyTacticity', tacticity)
+    oligomer.SetIntProp('_RadonPyRandomSeed', random_seed)
+    oligomer.SetProp('_RadonPyUnitOrientation', json.dumps(unit_orientations))
+    oligomer.SetIntProp('_RadonPyMappingSchemaVersion', RU_MAPPING_SCHEMA_VERSION)
+    return repeat, oligomer
+
+
+def transfer_center_unit_properties(repeat_mol: Chem.Mol, oligomer_mol: Chem.Mol,
+        properties: Sequence[str] = ('RESP', 'ESP'), atomic_charge_source: str = 'RESP',
+        linker_charge: float = 0.0, expected_unit_charge: float = 0.0,
+        constraint_tol: float = 1e-6) -> Chem.Mol:
+    """Copy validated central-unit atomic properties to a repeat-template copy.
+
+    Atom indices may change after conformer processing, so the actual mapping
+    is rebuilt from provenance stored on ``oligomer_mol``.
+
+    """
+
+    if not properties:
+        raise ValueError('properties must not be empty.')
+    if atomic_charge_source not in properties:
+        raise ValueError('atomic_charge_source must be included in properties.')
+    for name, value in (
+        ('linker_charge', linker_charge),
+        ('expected_unit_charge', expected_unit_charge),
+        ('constraint_tol', constraint_tol),
+    ):
+        if not np.isfinite(value):
+            raise ValueError('%s must be finite.' % name)
+    if constraint_tol <= 0.0:
+        raise ValueError('constraint_tol must be positive.')
+
+    # Validate the repeat-template side of the provenance contract.
+    repeat_source_ids = []
+    linker_source_ids = []
+    for atom in repeat_mol.GetAtoms():
+        if not atom.HasProp(RU_ATOM_INDEX_PROP) or not atom.HasProp(LINKER_ROLE_PROP):
+            raise ValueError('Repeating-unit atom provenance is incomplete.')
+        source_id = atom.GetIntProp(RU_ATOM_INDEX_PROP)
+        if source_id in repeat_source_ids:
+            raise ValueError('Repeating-unit atom provenance contains duplicate source atom IDs.')
+        repeat_source_ids.append(source_id)
+        if atom.GetProp(LINKER_ROLE_PROP) in ('head', 'tail'):
+            linker_source_ids.append(source_id)
+    if len(linker_source_ids) != 2:
+        raise ValueError('The repeating-unit template must contain exactly two linkers.')
+    non_linker_source_ids = [
+        source_id for source_id in repeat_source_ids
+        if source_id not in linker_source_ids
+    ]
+
+    # Atom properties survive Chem.RenumberAtoms; Mol properties do not.
+    # Reconstruct the unit count and middle unit from atom provenance.
+    unit_indices = set()
+    provenance_pairs = set()
+    for atom in oligomer_mol.GetAtoms():
+        if not atom.HasProp(RU_INSTANCE_PROP) or not atom.HasProp(RU_ATOM_INDEX_PROP) \
+                or not atom.HasProp(LINKER_ROLE_PROP):
+            raise ValueError('Oligomer atom provenance is incomplete.')
+        unit_id = atom.GetIntProp(RU_INSTANCE_PROP)
+        source_id = atom.GetIntProp(RU_ATOM_INDEX_PROP)
+        if source_id not in repeat_source_ids:
+            raise ValueError('Oligomer provenance contains an unknown repeating-unit atom ID.')
+        pair = (unit_id, source_id)
+        if pair in provenance_pairs:
+            raise ValueError('Oligomer atom provenance contains a duplicate unit/source pair.')
+        provenance_pairs.add(pair)
+        unit_indices.add(unit_id)
+    sorted_unit_indices = sorted(unit_indices)
+    if len(sorted_unit_indices) < 3 or len(sorted_unit_indices) % 2 == 0 \
+            or sorted_unit_indices != list(range(len(sorted_unit_indices))):
+        raise ValueError('Oligomer provenance must describe an odd sequence of repeating units.')
+    center_unit_index = sorted_unit_indices[len(sorted_unit_indices) // 2]
+    center_mapping = _mapped_unit_atoms(oligomer_mol, center_unit_index)
+    if set(center_mapping) != set(non_linker_source_ids):
+        raise ValueError('Could not reconstruct the complete central-unit mapping from provenance.')
+
+    for source_id, oligomer_idx in center_mapping.items():
+        _validate_repeat_atom_match(
+            repeat_mol, oligomer_mol, source_id, oligomer_idx, set(linker_source_ids)
+        )
+
+    # Read complete charge vectors before mutating the returned repeat copy.
+    property_values_by_name = {}
+    for property_name in properties:
+        values = []
+        for atom in oligomer_mol.GetAtoms():
+            if not atom.HasProp(property_name):
+                raise ValueError('Oligomer atoms do not all contain the %s property.' % property_name)
+            values.append(atom.GetDoubleProp(property_name))
+        values = np.asarray(values, dtype=float)
+        if values.shape != (oligomer_mol.GetNumAtoms(),) or not np.all(np.isfinite(values)):
+            raise ValueError('Oligomer %s charges must be a finite full-length vector.' % property_name)
+        property_values_by_name[property_name] = values
+
+    observed_unit_charge = sum(
+        property_values_by_name[atomic_charge_source][center_mapping[source_id]]
+        for source_id in non_linker_source_ids
+    )
+    if abs(observed_unit_charge - float(expected_unit_charge)) > float(constraint_tol):
+        raise ValueError('Central-unit charge violates the requested charge constraint.')
+
+    charged_repeat = utils.deepcopy_mol(repeat_mol)
+    source_to_repeat = {
+        atom.GetIntProp(RU_ATOM_INDEX_PROP): atom for atom in charged_repeat.GetAtoms()
+    }
+    for source_id in non_linker_source_ids:
+        atom = source_to_repeat[source_id]
+        for property_name in properties:
+            atom.SetDoubleProp(
+                property_name,
+                float(property_values_by_name[property_name][center_mapping[source_id]]),
+            )
+        atom.SetDoubleProp(
+            'AtomicCharge',
+            float(property_values_by_name[atomic_charge_source][center_mapping[source_id]]),
+        )
+    for source_id in linker_source_ids:
+        atom = source_to_repeat[source_id]
+        for property_name in properties:
+            atom.SetDoubleProp(property_name, float(linker_charge))
+        atom.SetDoubleProp('AtomicCharge', float(linker_charge))
+
+    transferred_unit_charge = sum(
+        source_to_repeat[source_id].GetDoubleProp('AtomicCharge')
+        for source_id in non_linker_source_ids
+    )
+    if abs(transferred_unit_charge - float(expected_unit_charge)) > float(constraint_tol):
+        raise ValueError('Transferred repeating-unit charge violates the requested charge constraint.')
+    return charged_repeat
 
 
 def copolymerize_mols(mols, n, init_poly=None, headhead=False, confId=0, tacticity='atactic', atac_ratio=0.5,

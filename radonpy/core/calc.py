@@ -16,12 +16,17 @@ from scipy.stats import maxwell
 import multiprocessing as MP
 import concurrent.futures as confu
 import gc
+import json
+import operator
+import tempfile
 from decimal import Decimal
 from fractions import Fraction
-from rdkit import Chem
-from rdkit.Chem import AllChem, TorsionFingerprints
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+from rdkit import Chem, rdBase
+from rdkit.Chem import AllChem, TorsionFingerprints, rdMolAlign
 from rdkit import Geometry as Geom
 from rdkit.ML.Cluster import Butina
+from rdkit.SimDivFilters.rdSimDivPickers import MaxMinPicker
 from . import utils, const
 
 __version__ = '1.0b1'
@@ -52,6 +57,42 @@ if const.mpi4py_avail:
     except ImportError as e:
         utils.radon_print('Cannot import mpi4py. Change to const.mpi4py_avail = False. %s' % e, level=2)
         const.mpi4py_avail = False
+
+
+def validate_charge_constraints(
+        charge_constraints: Optional[Sequence[Tuple[float, Sequence[int]]]],
+        natom: int) -> List[Tuple[float, List[int]]]:
+    """Return normalized ``(target, atom IDs)`` constraints.
+
+    This public representation uses RDKit's zero-based atom indices.  The
+    RESP wrapper converts it to RESP's one-based representation internally.
+    """
+
+    if charge_constraints is None:
+        return []
+    validated = []
+    used_indices = set()
+    for target, atom_indices in charge_constraints:
+        if isinstance(target, (bool, np.bool_)):
+            raise TypeError('A charge-constraint target must be numeric (bool is not allowed).')
+        target = float(target)
+        if not np.isfinite(target):
+            raise ValueError('A charge-constraint target must be finite.')
+        if not atom_indices:
+            raise ValueError('A charge-constraint atom group must not be empty.')
+        group = []
+        for atom_idx in atom_indices:
+            if isinstance(atom_idx, (bool, np.bool_)) or not isinstance(atom_idx, (int, np.integer)):
+                raise TypeError('Charge-constraint atom indices must be integers (bool is not allowed).')
+            atom_idx = int(atom_idx)
+            if atom_idx < 0 or atom_idx >= natom:
+                raise ValueError('A charge-constraint atom index is out of range.')
+            if atom_idx in used_indices:
+                raise ValueError('An atom index may occur in only one public charge constraint.')
+            used_indices.add(atom_idx)
+            group.append(atom_idx)
+        validated.append((target, group))
+    return validated
 
 
 def fix_trans(coord):
@@ -346,11 +387,12 @@ def get_num_radicals(mol):
     return nr
 
 
-def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=None, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
+def assign_charges(mol, charge='gasteiger', confId=0, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
     opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', opt_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'}, 
     geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO',
     charge_method='HF', charge_basis='6-31G(d)', charge_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'},
-    total_charge=None, total_multiplicity=None, resp_options=None, **kwargs):
+    total_charge=None, total_multiplicity=None, confId_list=None, weights=None, resp_options=None, charge_constraints=None,
+    constraint_tol=1e-6, return_comparison=False, **kwargs):
     """
     calc.assign_charges
 
@@ -365,8 +407,15 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
         confId: Target conformer ID (int). ``RESP`` uses only this conformer.
         confId_list: Ordered list of RDKit conformer IDs used by ``multi-conformer RESP`` (list or tuple).
         weights: RESP weights in the same order as ``confId_list`` (list or tuple). The upstream RESP package
-            squares each weight when adding a conformer's contribution to the objective function.
+            squares each weight when adding a conformer's contribution to the objective function. Every weight
+            must be finite and strictly positive.
         resp_options: Additional options passed to RESP for ``multi-conformer RESP`` (dict, optional).
+            String keys are normalized to uppercase. ``RESP_A`` sets stage 1 only;
+            stage 2 uses 0.001. Use ``charge_constraints`` for charge-sum constraints.
+        charge_constraints: Zero-based ``(target_charge, atom_indices)`` constraints used only by
+            ``multi-conformer RESP`` (list or tuple, optional).
+        return_comparison: Also fit each conformer independently using the same ESP (multi-conformer RESP only).
+            Individual fits use weight 1 and their own stage-1 charges for stage-2 constraints.
         opt: Do optimization (boolean). ``multi-conformer RESP`` requires pre-optimized conformers and ``opt=False``;
             optimize them first with ``qm.conformation_search()`` or a similar procedure.
         work_dir: Work directory path (str)
@@ -380,8 +429,17 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
         charge_basis_gen: Using basis set in the charge calculation for each element
 
     Returns:
-        boolean
+        boolean by default. With ``return_comparison=True``, returns ``(success, comparison)``;
+        ``comparison`` is None on failure, otherwise a dict with ``conf_ids``, ``resp_weights``,
+        ``joint_resp`` (natoms,), and ``individual_resp`` (nconf, natoms), in RDKit atom order.
+        AtomicCharge always uses the joint fit.
     """
+
+    failed_result = (False, None) if return_comparison else False
+    comparison = None
+    if return_comparison and charge != 'multi-conformer RESP':
+        utils.radon_print('return_comparison is supported only for multi-conformer RESP.', level=2)
+        return failed_result
 
     if charge == 'zero':
         for p in mol.GetAtoms():
@@ -395,7 +453,7 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
     elif charge == 'multi-conformer RESP':
         if not qm_avail:
             utils.radon_print('Cannot import psi4_wrapper. You can use psi4_wrapper by "conda install -c psi4 psi4 resp dftd3"', level=2)
-            return False
+            return failed_result
 
         if opt:
             utils.radon_print(
@@ -403,48 +461,54 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
                 'Optimize the conformers first with qm.conformation_search() or a similar procedure, then call assign_charges with opt=False.',
                 level=2,
             )
-            return False
+            return failed_result
 
         if not isinstance(qm_solver, str) or qm_solver.lower() != 'psi4':
             utils.radon_print('multi-conformer RESP is supported only with qm_solver="psi4".', level=2)
-            return False
+            return failed_result
 
         if confId_list is None:
             utils.radon_print('confId_list must be explicitly specified for multi-conformer RESP.', level=2)
-            return False
+            return failed_result
         if not isinstance(confId_list, (list, tuple)):
             utils.radon_print('confId_list must be a list or tuple for multi-conformer RESP.', level=2)
-            return False
+            return failed_result
         if len(confId_list) < 2:
             utils.radon_print('confId_list must contain at least two conformer IDs for multi-conformer RESP.', level=2)
-            return False
+            return failed_result
 
         validated_conf_ids = []
         for conf_id in confId_list:
             if isinstance(conf_id, (bool, np.bool_)) or not isinstance(conf_id, (int, np.integer)):
-                utils.radon_print('Each conformer ID in confId_list must be an integer (bool is not allowed).', level=2)
-                return False
+                utils.radon_print(
+                    'Each conformer ID in confId_list must be an integer (bool is not allowed).',
+                    level=2,
+                )
+                return failed_result
             conf_id = int(conf_id)
             try:
                 mol.GetConformer(conf_id)
             except (ValueError, RuntimeError, OverflowError, IndexError):
                 utils.radon_print('Conformer ID %i in confId_list does not exist.' % conf_id, level=2)
-                return False
+                return failed_result
             validated_conf_ids.append(conf_id)
 
         if len(set(validated_conf_ids)) != len(validated_conf_ids):
             utils.radon_print('Duplicate conformer IDs are not allowed in confId_list.', level=2)
-            return False
+            return failed_result
 
         if weights is None:
             validated_weights = [1.0] * len(validated_conf_ids)
         else:
             if not isinstance(weights, (list, tuple)):
                 utils.radon_print('weights must be a list or tuple for multi-conformer RESP.', level=2)
-                return False
+                return failed_result
             if len(weights) != len(validated_conf_ids):
-                utils.radon_print('weights must have the same length as confId_list for multi-conformer RESP.', level=2)
-                return False
+                utils.radon_print(
+                    'weights must have the same length as confId_list for multi-conformer RESP.',
+                    level=2,
+                )
+                return failed_result
 
             validated_weights = []
             for weight in weights:
@@ -452,22 +516,30 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
                     weight = float(weight)
                 except (TypeError, ValueError, OverflowError):
                     utils.radon_print('Each multi-conformer RESP weight must be convertible to float.', level=2)
-                    return False
-                if not np.isfinite(weight):
-                    utils.radon_print('Each multi-conformer RESP weight must be finite.', level=2)
-                    return False
-                if weight < 0.0:
-                    utils.radon_print('Multi-conformer RESP weights must not be negative.', level=2)
-                    return False
+                    return failed_result
+                if not np.isfinite(weight) or weight <= 0.0:
+                    utils.radon_print(
+                        'Each multi-conformer RESP weight must be finite and strictly positive.',
+                        level=2,
+                    )
+                    return failed_result
                 validated_weights.append(weight)
-
-            if not any(weight > 0.0 for weight in validated_weights):
-                utils.radon_print('At least one multi-conformer RESP weight must be positive.', level=2)
-                return False
 
         if resp_options is not None and not isinstance(resp_options, dict):
             utils.radon_print('resp_options must be a dictionary for multi-conformer RESP.', level=2)
-            return False
+            return failed_result
+
+        try:
+            validated_constraints = validate_charge_constraints(charge_constraints, mol.GetNumAtoms())
+        except (TypeError, ValueError) as e:
+            utils.radon_print(str(e), level=2)
+            return failed_result
+        if isinstance(constraint_tol, (bool, np.bool_)) \
+                or not isinstance(constraint_tol, (int, float, np.integer, np.floating)) \
+                or not np.isfinite(constraint_tol) \
+                or constraint_tol <= 0.0:
+            utils.radon_print('constraint_tol must be a finite positive number.', level=2)
+            return failed_result
 
         if type(total_charge) is int:
             kwargs['charge'] = total_charge
@@ -476,19 +548,38 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
 
         psi4mol = QMw(mol, confId=confId, work_dir=work_dir, tmp_dir=tmp_dir, qm_solver=qm_solver, method=charge_method, basis=charge_basis,
                         basis_gen=charge_basis_gen, name=log_name, **kwargs)
-        if resp_options is None:
-            psi4mol.resp_multi(validated_conf_ids, weights=validated_weights)
-        else:
-            psi4mol.resp_multi(validated_conf_ids, weights=validated_weights, resp_options=resp_options)
+        resp_call_kwargs = {'weights': validated_weights, 'constraint_tol': float(constraint_tol)}
+        if resp_options is not None:
+            resp_call_kwargs['resp_options'] = resp_options
+        if validated_constraints:
+            resp_call_kwargs['charge_constraints'] = validated_constraints
+        if return_comparison:
+            resp_call_kwargs['return_comparison'] = True
+        resp_result = psi4mol.resp_multi(validated_conf_ids, **resp_call_kwargs)
         if psi4mol.error_flag:
-            return False
+            return failed_result
 
-        resp_charges = [atom.GetDoubleProp('RESP') for atom in psi4mol.mol.GetAtoms()]
-        esp_charges = [atom.GetDoubleProp('ESP') for atom in psi4mol.mol.GetAtoms()]
+        if return_comparison:
+            _, comparison = resp_result
+
+        try:
+            resp_charges = np.asarray([atom.GetDoubleProp('RESP') for atom in psi4mol.mol.GetAtoms()], dtype=float)
+            esp_charges = np.asarray([atom.GetDoubleProp('ESP') for atom in psi4mol.mol.GetAtoms()], dtype=float)
+        except (KeyError, RuntimeError, ValueError):
+            return failed_result
+        if resp_charges.shape != (mol.GetNumAtoms(),) or esp_charges.shape != (mol.GetNumAtoms(),) \
+                or not np.all(np.isfinite(resp_charges)) or not np.all(np.isfinite(esp_charges)):
+            return failed_result
+        molecular_charge = total_charge if type(total_charge) is int else Chem.rdmolops.GetFormalCharge(mol)
+        if abs(float(np.sum(resp_charges)) - molecular_charge) > float(constraint_tol):
+            return failed_result
+        for target, atom_indices in validated_constraints:
+            if abs(float(np.sum(resp_charges[atom_indices])) - target) > float(constraint_tol):
+                return failed_result
         for i, atom in enumerate(mol.GetAtoms()):
-            atom.SetDoubleProp('RESP', resp_charges[i])
-            atom.SetDoubleProp('ESP', esp_charges[i])
-            atom.SetDoubleProp('AtomicCharge', resp_charges[i])
+            atom.SetDoubleProp('RESP', float(resp_charges[i]))
+            atom.SetDoubleProp('ESP', float(esp_charges[i]))
+            atom.SetDoubleProp('AtomicCharge', float(resp_charges[i]))
 
         del psi4mol
         gc.collect()
@@ -553,7 +644,294 @@ def assign_charges(mol, charge='gasteiger', confId=0, confId_list=None, weights=
         utils.radon_print('%s is not implemented in RadonPy.' % (charge), level=3)
         return False
 
-    return True
+    return (True, comparison) if return_comparison else True
+
+
+def assign_charges_from_oligomer(psmiles: str, oligomer_n: int = 3, terminal: str = 'H',
+        tacticity: str = 'isotactic', random_seed: Optional[int] = None,
+        unit_charge: Union[str, float] = 'formal', enforce_unit_charge: bool = True,
+        resp_conf_ids: Optional[Sequence[int]] = None,
+        resp_weights: Optional[Sequence[float]] = None,
+        conformer_search_kwargs: Optional[dict] = None, resp_kwargs: Optional[dict] = None,
+        return_result: bool = False, return_comparison: bool = False) -> Union[Chem.Mol, Tuple[Chem.Mol, Dict[str, object]]]:
+    """Derive one repeating unit's charges from full-oligomer conformers.
+
+    Multi-conformer RESP averages conformations of one fixed oligomer
+    stereosequence. It does not average distinct stereosequences.
+
+    Args:
+        psmiles: Connected, two-linker homopolymer PSMILES.
+        oligomer_n: Odd oligomer length greater than or equal to three.
+        terminal: Terminal cap mode. Only ``'H'`` is currently supported.
+        tacticity: ``'isotactic'`` or a seeded ``'atactic'`` sequence.
+        random_seed: Seed used for tacticity and conformer generation. If None,
+            generate a positive random seed and record it in the charge metadata.
+        unit_charge: ``'formal'`` or a numeric repeat-unit charge target.
+        enforce_unit_charge: Apply the repeat-unit target in both RESP stages.
+        resp_conf_ids: DFT-converged conformer IDs, or all successes by default.
+            With MaxMin, IDs refer to the MM selection, before QM exclusions.
+        resp_weights: Strictly positive RESP weights in conformer-ID order.
+            With MaxMin, supply one weight per actual MM pick (or resp_conf_ids),
+            before QM failure/duplicate removal; surviving weights follow IDs.
+        conformer_search_kwargs: Extra options for :func:`conformation_search`.
+            Defaults to ``dft_nconf=4``. Opt into ``selection='maxmin'`` for
+            ``nconf=1000, nselect=8, etkdg_ver=2, rmsthresh=-1, dft_nconf=8``.
+            Set ``dft_nconf=0`` to use MM geometries; QM ESP is still computed.
+        resp_kwargs: Extra options for :func:`assign_charges`.
+        return_result: Return diagnostics together with the charged repeat.
+        return_comparison: Also return independent two-stage RESP fits from the same ESP.
+            Implies ``return_result=True``; all atom charges are for the full oligomer.
+
+    Returns:
+        A charged repeating-unit ``Mol``. When either return flag is True, returns
+        ``(charged_repeat, data)`` with the oligomer and diagnostics in ``data``.
+        Comparison mode adds ``data["comparison"]`` (see :func:`assign_charges`) and
+        ``data["center_atom_indices"]`` in repeating-unit atom order, excluding linkers.
+        Any RESP failure raises RuntimeError before transferring charges.
+    """
+
+    # Local import avoids the core.poly -> core.calc import cycle at module load.
+    from . import poly
+
+    if not isinstance(enforce_unit_charge, (bool, np.bool_)):
+        raise TypeError('enforce_unit_charge must be boolean.')
+
+    if random_seed is None:
+        random_seed = int(np.random.default_rng().integers(1, 2**31 - 1))
+
+    repeat_mol, oligomer_mol = poly.build_mapped_oligomer(
+        psmiles, n=oligomer_n, terminal=terminal, tacticity=tacticity,
+        random_seed=random_seed,
+    )
+    formal_unit_charge = sum(atom.GetFormalCharge() for atom in repeat_mol.GetAtoms())
+    if unit_charge == 'formal':
+        target_unit_charge = float(formal_unit_charge)
+    else:
+        if isinstance(unit_charge, (bool, np.bool_)):
+            raise TypeError("unit_charge must be 'formal' or a finite number.")
+        target_unit_charge = float(unit_charge)
+        if not np.isfinite(target_unit_charge):
+            raise ValueError('unit_charge must be finite.')
+
+    conformer_kwargs = dict(conformer_search_kwargs or {})
+    maxmin = conformer_kwargs.get('selection') == 'maxmin'
+    conformer_kwargs.setdefault('dft_nconf', conformer_kwargs.get('nselect', 8) if maxmin else 4)
+    if maxmin:
+        conformer_kwargs.setdefault('nconf', 1000)
+        conformer_kwargs.setdefault('nselect', 8)
+        conformer_kwargs.setdefault('etkdg_ver', 2)  # Inherit the existing ETKDG generation explicitly.
+        conformer_kwargs.setdefault('rmsthresh', -1.0)  # No embedding pruning unless requested.
+    conformer_kwargs.setdefault('random_seed', int(random_seed))
+
+    charge_kwargs = dict(resp_kwargs or {})
+    reserved_charge_keys = {
+        'charge', 'confId_list', 'weights', 'opt', 'charge_constraints', 'constraint_tol',
+        'return_comparison'
+    }
+    conflicting_keys = reserved_charge_keys.intersection(charge_kwargs)
+    if conflicting_keys:
+        raise ValueError(
+            'resp_kwargs may not override workflow arguments: %s'
+            % ', '.join(sorted(conflicting_keys))
+        )
+
+    with tempfile.TemporaryDirectory(prefix='radonpy_oligomer_resp_') as run_dir:
+        if conformer_kwargs.get('work_dir') is None:
+            conformer_kwargs['work_dir'] = run_dir
+        if conformer_kwargs.get('tmp_dir') is None:
+            conformer_kwargs['tmp_dir'] = conformer_kwargs['work_dir']
+        oligomer, conformer_energies = conformation_search(oligomer_mol, **conformer_kwargs)
+        selection_info = json.loads(oligomer.GetProp('_RadonPyConformerSelection')) if maxmin else None
+
+        conformers = list(oligomer.GetConformers())
+        dft_attempted_conf_ids = sorted(
+            conf.GetId() for conf in conformers if conf.HasProp('_RadonPyDFTConverged')
+        )
+        converged_conf_ids = sorted(
+            conf.GetId() for conf in conformers
+            if conf.HasProp('_RadonPyDFTConverged') and conf.GetBoolProp('_RadonPyDFTConverged')
+        )
+        dft_failed_conf_ids = sorted(
+            conf.GetId() for conf in conformers
+            if conf.HasProp('_RadonPyDFTConverged') and not conf.GetBoolProp('_RadonPyDFTConverged')
+        )
+        mm_only_conf_ids = sorted(
+            conf.GetId() for conf in conformers if not conf.HasProp('_RadonPyDFTConverged')
+        )
+        eligible_ids = selection_info['selected_conf_ids'] if maxmin else converged_conf_ids
+        if resp_conf_ids is None:
+            selected_conf_ids = list(eligible_ids)
+        else:
+            selected_conf_ids = []
+            for conf_id in resp_conf_ids:
+                if isinstance(conf_id, (bool, np.bool_)):
+                    raise TypeError('resp_conf_ids must contain integers (bool is not allowed).')
+                conf_id = operator.index(conf_id)
+                if conf_id not in eligible_ids:
+                    raise ValueError('Every RESP conformer ID must be in the MaxMin selection.' if maxmin
+                                     else 'Every RESP conformer ID must be DFT-converged.')
+                if conf_id in selected_conf_ids:
+                    raise ValueError('resp_conf_ids must not contain duplicates.')
+                selected_conf_ids.append(conf_id)
+        if not maxmin and len(selected_conf_ids) < 2:
+            raise RuntimeError('At least two DFT-converged conformers are required for multi-conformer RESP.')
+
+        if resp_weights is None:
+            selected_weights = [1.0] * len(selected_conf_ids)
+        else:
+            if len(resp_weights) != len(selected_conf_ids):
+                raise ValueError('resp_weights must match the number of selected conformers.')
+            selected_weights = []
+            for weight in resp_weights:
+                weight = float(weight)
+                if not np.isfinite(weight) or weight <= 0.0:
+                    raise ValueError('Every RESP weight must be finite and strictly positive.')
+                selected_weights.append(weight)
+
+        if maxmin:
+            # User weights refer to the MM selection (or explicit resp_conf_ids),
+            # before QM failure/duplicate removal. Never infer or truncate weights.
+            selection_info['resp_input_conf_ids'] = list(selected_conf_ids)
+            selection_info['resp_input_weights'] = list(selected_weights)
+            weights_by_id = dict(zip(selected_conf_ids, selected_weights))
+            selected_conf_ids = [cid for cid in selected_conf_ids if cid in selection_info['final_conf_ids']]
+            selected_weights = [weights_by_id[cid] for cid in selected_conf_ids]
+            selection_info['resp_conf_ids'] = list(selected_conf_ids)
+            if len(selected_conf_ids) < 2:
+                raise RuntimeError(
+                    '%i valid conformer(s) remain after MaxMin/QM checks; RESP not started. '
+                    'The existing constrained multi-conformer RESP requires at least two. '
+                    'Selection diagnostics: %s' % (len(selected_conf_ids), json.dumps(selection_info))
+                )
+
+        unit_indices = sorted({
+            atom.GetIntProp(poly.RU_INSTANCE_PROP)
+            for atom in oligomer.GetAtoms()
+            if atom.HasProp(poly.RU_INSTANCE_PROP)
+        })
+        if unit_indices != list(range(oligomer_n)):
+            raise ValueError('Repeating-unit provenance changed during conformer search.')
+        center_unit_index = unit_indices[len(unit_indices) // 2]
+        center_mapping = poly._mapped_unit_atoms(oligomer, center_unit_index)
+        center_source_ids = [
+            atom.GetIntProp(poly.RU_ATOM_INDEX_PROP)
+            for atom in repeat_mol.GetAtoms()
+            if atom.GetProp(poly.LINKER_ROLE_PROP) == 'none'
+        ]
+        if set(center_mapping) != set(center_source_ids):
+            raise ValueError('Central-unit provenance changed during conformer search.')
+        center_atom_indices = [center_mapping[source_id] for source_id in center_source_ids]
+        charge_constraints = (
+            [(target_unit_charge, center_atom_indices)] if enforce_unit_charge else []
+        )
+
+        if charge_kwargs.get('work_dir') is None:
+            charge_kwargs['work_dir'] = run_dir
+        if charge_kwargs.get('tmp_dir') is None:
+            charge_kwargs['tmp_dir'] = charge_kwargs['work_dir']
+        charge_kwargs.setdefault('log_name', 'oligomer_resp')
+        if return_comparison:
+            charge_kwargs['return_comparison'] = True
+        charge_assignment_succeeded = assign_charges(
+            oligomer,
+            charge='multi-conformer RESP',
+            confId_list=selected_conf_ids,
+            weights=selected_weights,
+            opt=False,
+            charge_constraints=charge_constraints,
+            constraint_tol=1e-6,
+            **charge_kwargs
+        )
+        if return_comparison:
+            charge_assignment_succeeded, comparison = charge_assignment_succeeded
+        if not charge_assignment_succeeded:
+            raise RuntimeError('Multi-conformer RESP failed; no repeating-unit charges were transferred.')
+        if maxmin:
+            selection_info['resp_used_count'] = len(selected_conf_ids)
+            oligomer.SetProp('_RadonPyConformerSelection', json.dumps(selection_info, sort_keys=True))
+            utils.radon_print('RESP used %i conformers in selection order: %s'
+                             % (len(selected_conf_ids), selected_conf_ids))
+
+    observed_unit_charge = float(sum(
+        oligomer.GetAtomWithIdx(atom_idx).GetDoubleProp('RESP')
+        for atom_idx in center_atom_indices
+    ))
+    charged_repeat = poly.transfer_center_unit_properties(
+        repeat_mol,
+        oligomer,
+        expected_unit_charge=target_unit_charge if enforce_unit_charge else observed_unit_charge,
+        constraint_tol=1e-6,
+    )
+
+    molecular_charge = charge_kwargs.get('total_charge')
+    if molecular_charge is None:
+        molecular_charge = Chem.rdmolops.GetFormalCharge(oligomer)
+    full_charge_residual = float(sum(
+        atom.GetDoubleProp('RESP') for atom in oligomer.GetAtoms()
+    ) - molecular_charge)
+    unit_charge_residual = observed_unit_charge - target_unit_charge
+
+    radicals = get_num_radicals(oligomer)
+    multiplicity = charge_kwargs.get('total_multiplicity')
+    if multiplicity is None:
+        multiplicity = 1 if radicals == 0 else 2 if radicals % 2 == 1 else 3
+    resp_plugin_options = charge_kwargs.get('resp_options') or {}
+    resp_a = 0.0005
+    resp_b = 0.1
+    for option_name, option_value in resp_plugin_options.items():
+        if not isinstance(option_name, str):
+            continue
+        if option_name.upper() == 'RESP_A':
+            resp_a = option_value
+        elif option_name.upper() == 'RESP_B':
+            resp_b = option_value
+
+    metadata = {
+        'psmiles': oligomer.GetProp('_RadonPyOriginalPSMILES'),
+        'oligomer_n': oligomer.GetIntProp('_RadonPyOligomerN'),
+        'center_unit_index': center_unit_index,
+        'terminal': oligomer.GetProp('_RadonPyTerminal'),
+        'cap': oligomer.GetProp('_RadonPyTerminal'),
+        'label': oligomer.GetIntProp('_RadonPyLinkerLabel'),
+        'tacticity': oligomer.GetProp('_RadonPyTacticity'),
+        'random_seed': oligomer.GetIntProp('_RadonPyRandomSeed'),
+        'unit_orientation': json.loads(oligomer.GetProp('_RadonPyUnitOrientation')),
+        'selected_conf_ids': list(selected_conf_ids),
+        'dft_attempted_conf_ids': dft_attempted_conf_ids,
+        'dft_converged_conf_ids': converged_conf_ids,
+        'dft_failed_conf_ids': dft_failed_conf_ids,
+        'mm_only_conf_ids': mm_only_conf_ids,
+        'resp_weights': list(selected_weights),
+        'qm_method': charge_kwargs.get('charge_method', 'HF'),
+        'qm_basis': charge_kwargs.get('charge_basis', '6-31G(d)'),
+        'molecular_charge': float(molecular_charge),
+        'multiplicity': int(multiplicity),
+        'RESP_A': float(resp_a),
+        'RESP_B': float(resp_b),
+        'unit_charge_target': target_unit_charge,
+        'unit_charge_observed': observed_unit_charge,
+        'constraint_residual': unit_charge_residual,
+        'full_charge_residual': full_charge_residual,
+        'mapping_schema_version': poly.RU_MAPPING_SCHEMA_VERSION,
+    }
+    if maxmin:
+        metadata['conformer_selection'] = selection_info
+    charged_repeat.SetProp('_RadonPyOriginalPSMILES', psmiles)
+    charged_repeat.SetIntProp('_RadonPyOligomerN', oligomer.GetIntProp('_RadonPyOligomerN'))
+    charged_repeat.SetIntProp('_RadonPyCenterUnitIndex', center_unit_index)
+    charged_repeat.SetProp('_RadonPyChargeMetadata', json.dumps(metadata, sort_keys=True))
+
+    if return_result or return_comparison:
+        data = {
+            'oligomer_mol': oligomer,
+            'conformer_energies': conformer_energies,
+            **metadata,
+        }
+        if return_comparison:
+            data['comparison'] = comparison
+            data['center_atom_indices'] = center_atom_indices
+        return charged_repeat, data
+    return charged_repeat
 
 
 def charge_neutralize(mol, tol=1e-5):
@@ -882,11 +1260,184 @@ def fractional_free_volume(mol, confId=0, gridSpacing=0.2, method='grid'):
     return ffv
 
 
+def _conformer_distances(mol, conf_ids):
+    """TFD and fixed-all-atom RMSD matrices in explicit conf_ids order.
+
+    RMSD uses proper rotations (no reflection or symmetry remapping), in
+    angstrom. GetAlignmentTransform does not modify the input coordinates.
+    """
+    atom_map = [(i, i) for i in range(mol.GetNumAtoms())]
+    rms = np.zeros((len(conf_ids), len(conf_ids)))
+    for i, cid in enumerate(conf_ids):
+        for j in range(i):
+            rms[i, j] = rms[j, i] = rdMolAlign.GetAlignmentTransform(
+                mol, mol, prbCid=cid, refCid=conf_ids[j], atomMap=atom_map,
+                reflect=False,
+            )[0]
+    if not np.all(np.isfinite(rms)):
+        raise ValueError('Non-finite aligned RMSD in conformer candidates.')
+
+    info = {'distance_requested': 'tfd', 'distance': 'tfd', 'distance_units': 'dimensionless',
+            'useWeights': False, 'maxDev': 'equal', 'symmRadius': 2,
+            'ignoreColinearBonds': True, 'fallback_reason': None,
+            'duplicate_rmsd_tol_angstrom': 1e-5, 'tfd_zero_tol': 1e-12}
+    torsions, rings = TorsionFingerprints.CalculateTorsionLists(mol, maxDev='equal')
+    distances = np.zeros_like(rms)
+    if not torsions and not rings:
+        info['fallback_reason'] = 'No TFD torsions; use fixed-all-atom aligned RMSD.'
+    elif len(conf_ids) > 1:
+        subset = Chem.Mol(mol)
+        subset.RemoveAllConformers()
+        for cid in conf_ids:
+            subset.AddConformer(mol.GetConformer(cid), assignId=False)
+        lower = np.asarray(TorsionFingerprints.GetTFDMatrix(
+            subset, useWeights=False, maxDev='equal'), dtype=float)
+        indices = np.tril_indices(len(conf_ids), -1)
+        distances[indices] = lower
+        distances += distances.T
+        info['tfd_zero_pairs'] = int(np.count_nonzero(lower <= info['tfd_zero_tol']))
+        if not np.all(np.isfinite(lower)):
+            info['fallback_reason'] = 'Non-finite TFD distances; use aligned RMSD.'
+        elif np.max(lower) <= info['tfd_zero_tol']:
+            info['fallback_reason'] = 'All TFD distances are numerically zero; use aligned RMSD.'
+    if info['fallback_reason']:
+        info.update(distance='rmsd', distance_units='angstrom')
+        distances = rms.copy()
+    return distances, rms, info
+
+
+def _deduplicate_conformers(conf_ids, rms, priority):
+    """Remove numerical duplicates at all-atom aligned RMSD <= 1e-5 angstrom."""
+    kept, excluded = [], []
+    for i in priority:
+        duplicate = next((j for j in kept if rms[i, j] <= 1e-5), None)
+        if duplicate is None:
+            kept.append(i)
+        else:
+            excluded.append({'conf_id': conf_ids[i], 'reason': 'numerical coordinate duplicate',
+                             'duplicate_of': conf_ids[duplicate], 'rmsd_angstrom': float(rms[i, duplicate])})
+    return kept, excluded
+
+
+def select_conformers(mol, energies, nselect=8, selection='maxmin', distance='tfd',
+                      random_seed=0, energy_window=None, return_result=False):
+    """Select MM conformer IDs in MaxMin order, starting at minimum MM energy.
+
+    ``energies`` is a dict keyed by actual confId, in kcal/mol; it must cover
+    every conformer exactly. Coordinates/atom order/IDs are not changed.
+    Failed ``_RadonPyMMConverged`` flags and non-finite candidates are excluded.
+    Without flags, the caller supplies already MM-converged candidates.
+    ``energy_window=None`` disables filtering relative to the MM minimum.
+    TFD settings are unweighted/equal; numerical duplicates use all-atom aligned
+    RMSD <= 1e-5 angstrom, never TFD alone. ``return_result`` also returns metadata.
+    """
+    if isinstance(nselect, (bool, np.bool_)) or operator.index(nselect) <= 0:
+        raise ValueError('nselect must be a positive integer.')
+    nselect = operator.index(nselect)
+    if selection != 'maxmin' or distance != 'tfd':
+        raise ValueError("Supported selection/distance: 'maxmin'/'tfd'.")
+    if isinstance(random_seed, (bool, np.bool_)) or not 0 <= operator.index(random_seed) < 2**31:
+        raise ValueError('random_seed must be an integer in [0, 2**31).')
+    random_seed = operator.index(random_seed)
+    if energy_window is not None:
+        energy_window = float(energy_window)
+        if not np.isfinite(energy_window) or energy_window < 0:
+            raise ValueError('energy_window must be finite and nonnegative (kcal/mol).')
+    input_ids = [conf.GetId() for conf in mol.GetConformers()]
+    if not isinstance(energies, dict) or set(energies) != set(input_ids):
+        raise ValueError('energies must map every actual confId to its MM energy (kcal/mol).')
+    energies = {cid: float(energies[cid]) for cid in input_ids}
+    valid, excluded = [], []
+    for cid in input_ids:
+        conf = mol.GetConformer(cid)
+        reason = None
+        if conf.HasProp('_RadonPyMMConverged') and not conf.GetBoolProp('_RadonPyMMConverged'):
+            reason = conf.GetProp('_RadonPyMMStatus') if conf.HasProp('_RadonPyMMStatus') else 'MM not converged'
+        elif not np.isfinite(energies[cid]) or not np.all(np.isfinite(conf.GetPositions())):
+            reason = 'Non-finite MM energy or coordinates'
+        if reason:
+            excluded.append({'conf_id': cid, 'reason': reason})
+        else:
+            valid.append(cid)
+    mm_success_count = len(valid)
+    if not valid:
+        raise ValueError('No valid MM candidates: %s' % (excluded or 'no conformers generated'))
+    minimum = min(energies[cid] for cid in valid)
+    candidates = []
+    for cid in valid:
+        if energy_window is not None and energies[cid] > minimum + energy_window:
+            excluded.append({'conf_id': cid, 'reason': 'outside MM energy window (kcal/mol)'})
+        else:
+            candidates.append(cid)
+    distances, rms, info = _conformer_distances(mol, candidates)
+    # Keep the lowest-energy representative, with storage order breaking ties.
+    priority = sorted(range(len(candidates)), key=lambda i: energies[candidates[i]])
+    unique, duplicates = _deduplicate_conformers(candidates, rms, priority)
+    excluded.extend(duplicates)
+    unique.sort()  # MaxMin's array positions retain the original storage order.
+    distances = distances[np.ix_(unique, unique)]
+    candidate_ids = [candidates[i] for i in unique]
+    first = min(range(len(candidate_ids)), key=lambda i: energies[candidate_ids[i]])
+    count = min(nselect, len(candidate_ids))
+    # LazyPick also supports picking the whole pool (Pick requires a smaller subset).
+    picks = list(MaxMinPicker().LazyPick(
+        lambda i, j: float(distances[i, j]), len(candidate_ids), count,
+        firstPicks=[first], seed=random_seed))
+    selected = [candidate_ids[i] for i in picks]
+    info.update(selection=selection, random_seed=random_seed, input_conf_ids=input_ids,
+                mm_success_count=mm_success_count, energy_window_kcal_mol=energy_window,
+                filtered_candidate_count=len(candidate_ids), candidate_conf_ids=candidate_ids,
+                selection_requested=nselect, selected_count=len(selected), selected_conf_ids=selected,
+                unselected_conf_ids=[cid for cid in candidate_ids if cid not in selected],
+                selected_mm_energies_kcal_mol=[energies[cid] for cid in selected],
+                selected_distances=distances[np.ix_(picks, picks)].tolist(), exclusions=excluded,
+                shortage_reason='Fewer valid, in-window, numerically distinct candidates than requested.'
+                if count < nselect else None)
+    if info['fallback_reason']:
+        utils.radon_print(info['fallback_reason'], level=1)
+    if info['shortage_reason']:
+        utils.radon_print('Selected %i/%i: %s' % (count, nselect, info['shortage_reason']), level=1)
+    return (selected, info) if return_result else selected
+
+
+def _finish_conformer_selection(mol, info, dft_results=None):
+    """Audit selected QM geometries without reordering or replenishing picks."""
+    selected = info['selected_conf_ids']
+    final_ids = list(selected)
+    if dft_results is not None:
+        final_ids, excluded = [], []
+        for energy, cid, failed in dft_results:
+            conf = mol.GetConformer(cid)
+            success = not failed and np.isfinite(energy) and np.all(np.isfinite(conf.GetPositions()))
+            conf.SetBoolProp('_RadonPyDFTConverged', bool(success))
+            if success:
+                final_ids.append(cid)
+            else:
+                excluded.append({'conf_id': cid, 'reason': 'QM optimization failed or non-finite result'})
+        if final_ids:
+            distances, rms, audit = _conformer_distances(mol, final_ids)
+            kept, duplicates = _deduplicate_conformers(final_ids, rms, range(len(final_ids)))
+            audit.update(conf_ids=list(final_ids), distances=distances.tolist(), rmsd_angstrom=rms.tolist())
+            final_ids = [final_ids[i] for i in kept]
+            excluded.extend(duplicates)
+        else:
+            audit = {'conf_ids': [], 'reason': 'No QM-converged finite geometries'}
+        audit['exclusions'] = excluded
+        info['qm_distance_check'] = audit
+    else:
+        info['qm_distance_check'] = {'reason': 'QM geometry optimization disabled; MM coordinates retained'}
+    info.update(final_conf_ids=final_ids, final_candidate_count=len(final_ids), resp_used_count=0)
+    utils.radon_print('MaxMin selected %i/%i; %i geometries available for RESP (QM opt=%s).'
+                     % (len(selected), info['selection_requested'], len(final_ids), dft_results is not None))
+    mol.SetProp('_RadonPyConformerSelection', json.dumps(info, sort_keys=True, allow_nan=False))
+
+
 def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmsthresh=0.5, tfdthresh=0.02, clustering='TFD',
         qm_solver='psi4', opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', opt_basis_gen={'Br': '6-31G(d,p)', 'I': 'lanl2dz'},
         geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO', log_name='mol', solver='lammps', solver_path=None, work_dir=None, tmp_dir=None,
         etkdg_omp=-1, psi4_omp=-1, psi4_mp=0, omp=1, mpi=-1, gpu=0, mm_mp=0, memory=1000,
-        total_charge=None, total_multiplicity=None, **kwargs):
+        total_charge=None, total_multiplicity=None, random_seed: Optional[int] = None,
+        selection=None, nselect=8, distance='tfd', energy_window=None, **kwargs):
     """
     calc.conformation_search
 
@@ -898,7 +1449,20 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
     Optional args:
         ff: Force field instance. If None, MMFF94 optimization is carried out by RDKit
         nconf: Number of generating conformations (int)
-        dft_nconf: Number of conformations for DFT optimization (int, default:0)
+        dft_nconf: Number of conformations for DFT optimization (int, default:0).
+            With ``selection='maxmin'``, 0 disables QM geometry optimization;
+            any positive value optimizes all nselect picks, never unselected candidates.
+        selection: None keeps the existing energy ranking/Butina path; 'maxmin'
+            selects diverse MM conformers and retains all candidates in the Mol.
+        nselect: Requested MaxMin count (int, default:8).
+        distance: 'tfd', unweighted/equal; falls back to fixed-all-atom RMSD
+            for absent/degenerate TFD. Numerical duplicates: RMSD <= 1e-5 angstrom.
+        energy_window: Optional MM window above minimum, in kcal/mol (default:None).
+        random_seed: Seed for ETKDG/MaxMin; the MaxMin path records a generated
+            seed if omitted. Reproduce within the same RDKit/backend environment.
+        etkdg_ver: Explicit ETKDG generation (1, 2 or 3); retains existing default 2.
+        rmsthresh: ETKDG RMS pruning threshold, angstrom; negative disables it.
+            MaxMin bypasses Butina regardless of clustering.
         solver: lammps (str)
         solver_path: File path of solver (str)
         work_dir: Path of work directory (str)
@@ -915,8 +1479,31 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
 
     Returns:
         RDKit Mol object
-        DFT and MM energy (ndarray, kcal/mol)
+        DFT and MM energy (ndarray, kcal/mol). MaxMin keeps MM-ranked IDs:
+        rows are indexed by confId, columns [QM, MM] if QM was requested,
+        otherwise a 1-D MM array. Unattempted QM entries are NaN. Selection
+        order and exclusions are in JSON property ``_RadonPyConformerSelection``;
+        use its final_conf_ids for ESP. GetConformers() order need not match IDs.
     """
+
+    if selection is not None:
+        if selection != 'maxmin' or distance != 'tfd':
+            raise ValueError("Supported selection/distance: 'maxmin'/'tfd'.")
+        for name, value in (('nconf', nconf), ('nselect', nselect)):
+            if isinstance(value, (bool, np.bool_)) or operator.index(value) <= 0:
+                raise ValueError('%s must be a positive integer.' % name)
+        if isinstance(dft_nconf, (bool, np.bool_)) or operator.index(dft_nconf) < 0:
+            raise ValueError('dft_nconf must be a nonnegative integer.')
+        if random_seed is None:
+            random_seed = int(np.random.default_rng().integers(0, 2**31 - 1))
+        if isinstance(random_seed, (bool, np.bool_)) or not 0 <= operator.index(random_seed) < 2**31:
+            raise ValueError('random_seed must be an integer in [0, 2**31).')
+        if energy_window is not None and (not np.isfinite(energy_window) or energy_window < 0):
+            raise ValueError('energy_window must be finite and nonnegative (kcal/mol).')
+        if etkdg_ver not in (1, 2, 3) or not np.isfinite(rmsthresh):
+            raise ValueError('Specify ETKDG generation 1, 2 or 3 and a finite pruning threshold.')
+        if ff and not MD_avail:
+            raise RuntimeError('The requested MM force field requires the MD backend.')
 
     mol_c = utils.deepcopy_mol(mol)
 
@@ -929,6 +1516,9 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
     else:
         utils.radon_print('Illegal input of etkdg_ver = %s' % clustering, level=3)
         return mol_c, np.array([])
+
+    if random_seed is not None:
+        etkdg.randomSeed = int(random_seed)
 
     if etkdg_omp < 0:
         etkdg_omp = utils.cpu_count()
@@ -943,14 +1533,22 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
 
     etkdg.pruneRmsThresh = rmsthresh
     etkdg.numThreads = etkdg_omp
+    requested_nconf = nconf
     AllChem.EmbedMultipleConfs(mol_c, nconf, etkdg)
     nconf = mol_c.GetNumConformers()
     utils.radon_print('%i conformers were generated.' % nconf)
+    if selection is not None:
+        if nconf == 0:
+            raise ValueError('No conformers generated by ETKDG (requested %i); RESP not started.' % requested_nconf)
+        for conf in mol_c.GetConformers():
+            conf.SetIntProp('_RadonPySourceConfId', conf.GetId())
+            for prop_name in ('_RadonPyDFTConverged', '_RadonPyMMConverged', '_RadonPyMMStatus'):
+                if conf.HasProp(prop_name):
+                    conf.ClearProp(prop_name)
 
     energies = []
-    dft_energies = []
+    dft_results = []
     e_res = []
-    e_dft_res = []
 
     # Optimization conformers by MM
     utils.radon_print('Start optimization of %i conformers by MM level.' % nconf, level=1)
@@ -969,7 +1567,7 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
         if (mm_mp > 0 or const.mpi4py_avail) and nconf > 1:
             utils.picklable(mol_c)
             c = utils.picklable_const()
-            args = [(mol_c, i, solver, solver_path, tmp_dir, omp, mpi, gpu, c) for i in range(nconf)]
+            args = [(mol_c, i, solver, solver_path, tmp_dir, omp, mpi, gpu, c, selection is not None) for i in range(nconf)]
 
             # mpi4py
             if const.mpi4py_avail:
@@ -979,6 +1577,9 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
 
                     for i, res in enumerate(results):
                         energies.append((res[0], i))
+                        if selection is not None:
+                            mol_c.GetConformer(i).SetBoolProp('_RadonPyMMConverged', res[2] == 'converged')
+                            mol_c.GetConformer(i).SetProp('_RadonPyMMStatus', res[2])
                         coord = res[1]
                         for j, atom in enumerate(mol_c.GetAtoms()):
                             mol_c.GetConformer(i).SetAtomPosition(j, Geom.Point3D(coord[j, 0], coord[j, 1], coord[j, 2]))
@@ -991,6 +1592,9 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
 
                     for i, res in enumerate(results):
                         energies.append((res[0], i))
+                        if selection is not None:
+                            mol_c.GetConformer(i).SetBoolProp('_RadonPyMMConverged', res[2] == 'converged')
+                            mol_c.GetConformer(i).SetProp('_RadonPyMMStatus', res[2])
                         coord = res[1]
                         for j, atom in enumerate(mol_c.GetAtoms()):
                             mol_c.GetConformer(i).SetAtomPosition(j, Geom.Point3D(coord[j, 0], coord[j, 1], coord[j, 2]))
@@ -998,8 +1602,15 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
         # Sequential execution of MM optimizations
         else:
             for i in tqdm(range(nconf), desc='[Conformation search]', disable=const.tqdm_disable):
-                mol_c, energy, _ = md.quick_min(mol_c, confId=i, min_style='cg', solver=solver,
-                                                solver_path=solver_path, work_dir=tmp_dir, omp=omp, mpi=mpi, gpu=gpu)
+                try:
+                    mol_c, energy, _ = md.quick_min(mol_c, confId=i, min_style='cg', solver=solver,
+                                                    solver_path=solver_path, work_dir=tmp_dir, omp=omp, mpi=mpi, gpu=gpu)
+                except Exception as exc:
+                    if selection is None:
+                        raise
+                    energy = np.nan
+                    mol_c.GetConformer(i).SetBoolProp('_RadonPyMMConverged', False)
+                    mol_c.GetConformer(i).SetProp('_RadonPyMMStatus', 'MM failed: %s' % exc)
                 energies.append((energy, i))
 
     else:
@@ -1010,7 +1621,8 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
         if (mm_mp > 0 or const.mpi4py_avail) and nconf > 1:
             utils.picklable(mol_c)
             c = utils.picklable_const()
-            args = [(mol_c, prop, i, c) for i in range(nconf)]
+            # RDKit MMFFMolProperties cannot be pickled; reconstruct in each worker.
+            args = [(mol_c, None, i, c, selection is not None) for i in range(nconf)]
 
             # mpi4py
             if const.mpi4py_avail:
@@ -1020,6 +1632,9 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
 
                     for i, res in enumerate(results):
                         energies.append((res[0], i))
+                        if selection is not None:
+                            mol_c.GetConformer(i).SetBoolProp('_RadonPyMMConverged', res[2] == 'converged')
+                            mol_c.GetConformer(i).SetProp('_RadonPyMMStatus', res[2])
                         coord = res[1]
                         for j, atom in enumerate(mol_c.GetAtoms()):
                             mol_c.GetConformer(i).SetAtomPosition(j, Geom.Point3D(coord[j, 0], coord[j, 1], coord[j, 2]))
@@ -1032,6 +1647,9 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
 
                     for i, res in enumerate(results):
                         energies.append((res[0], i))
+                        if selection is not None:
+                            mol_c.GetConformer(i).SetBoolProp('_RadonPyMMConverged', res[2] == 'converged')
+                            mol_c.GetConformer(i).SetProp('_RadonPyMMStatus', res[2])
                         coord = res[1]
                         for j, atom in enumerate(mol_c.GetAtoms()):
                             mol_c.GetConformer(i).SetAtomPosition(j, Geom.Point3D(coord[j, 0], coord[j, 1], coord[j, 2]))
@@ -1039,18 +1657,62 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
         # Sequential execution of RDKit optimizations
         else:
             for i in tqdm(range(nconf), desc='[Conformation search]', disable=const.tqdm_disable):
-                mmff = AllChem.MMFFGetMoleculeForceField(mol_c, prop, confId=i)
-                mmff.Minimize()
-                energies.append((mmff.CalcEnergy(), i))
+                try:
+                    mmff = AllChem.MMFFGetMoleculeForceField(mol_c, prop, confId=i)
+                    status = mmff.Minimize()
+                    energy = mmff.CalcEnergy()
+                    reason = 'converged' if status == 0 else 'MM minimization status %s' % status
+                except Exception as exc:
+                    if selection is None:
+                        raise
+                    energy, reason = np.nan, 'MM failed: %s' % exc
+                if selection is not None:
+                    mol_c.GetConformer(i).SetBoolProp('_RadonPyMMConverged', reason == 'converged')
+                    mol_c.GetConformer(i).SetProp('_RadonPyMMStatus', reason)
+                energies.append((energy, i))
 
     # Sort by MM energy
     energies = np.array(energies)
-    energies = energies[np.argsort(energies[:, 0])]
+    energies = energies[np.argsort(energies[:, 0], kind='stable' if selection else 'quicksort')]
     e_res = energies[:, 0]
     for i in range(nconf):
         mol_c.GetConformer(i).SetId(i+nconf)
     for i, cid in enumerate(energies):
         mol_c.GetConformer(int(cid[1]+nconf)).SetId(i)
+
+    if selection is not None:
+        selected_ids, selection_info = select_conformers(
+            mol_c, {int(cid): float(e_res[int(cid)]) for cid in range(nconf)},
+            nselect=nselect, selection=selection, distance=distance,
+            random_seed=random_seed, energy_window=energy_window, return_result=True,
+        )
+        selection_info.update(
+            generation_requested=requested_nconf, generated_count=nconf, rdkit_version=rdBase.rdkitVersion,
+            etkdg_generation='ETKDGv%i' % etkdg_ver,
+            etkdg_settings={name: getattr(etkdg, name) for name in (
+                'randomSeed', 'numThreads', 'pruneRmsThresh', 'enforceChirality', 'useRandomCoords',
+                'useExpTorsionAnglePrefs', 'useBasicKnowledge', 'ETversion', 'clearConfs',
+                'useSmallRingTorsions', 'useMacrocycleTorsions', 'useMacrocycle14config',
+                'onlyHeavyAtomsForRMS', 'useSymmetryForPruning', 'maxIterations') if hasattr(etkdg, name)},
+            mm_settings=({'backend': solver, 'force_field': type(ff).__name__, 'min_style': 'cg',
+                          'etol': 1e-4, 'ftol': 1e-6, 'maxiter': 10000, 'maxeval': 100000,
+                          'omp': omp, 'mpi': mpi, 'gpu': gpu, 'mm_mp': mm_mp, 'solver_path': solver_path}
+                         if ff else {'backend': 'RDKit', 'force_field': 'MMFF94', 'maxIts': 200,
+                                     'forceTol': 1e-4, 'energyTol': 1e-6, 'nonBondedThresh': 100.0,
+                                     'ignoreInterfragInteractions': True, 'mm_mp': mm_mp}),
+            qm_settings={'enabled': dft_nconf > 0, 'dft_nconf': dft_nconf, 'solver': qm_solver,
+                         'method': opt_method, 'basis': opt_basis, 'basis_gen': opt_basis_gen,
+                         'geom_iter': geom_iter, 'geom_conv': geom_conv, 'geom_algorithm': geom_algorithm},
+            candidates=[{'conf_id': conf.GetId(), 'source_conf_id': conf.GetIntProp('_RadonPySourceConfId'),
+                         'mm_energy_kcal_mol': float(e_res[conf.GetId()]) if np.isfinite(e_res[conf.GetId()]) else None,
+                         'mm_status': conf.GetProp('_RadonPyMMStatus') if conf.HasProp('_RadonPyMMStatus') else 'unknown'}
+                        for conf in mol_c.GetConformers()],
+            selected_source_conf_ids=[mol_c.GetConformer(cid).GetIntProp('_RadonPySourceConfId') for cid in selected_ids],
+            clustering=None,
+        )
+        if requested_nconf > nconf:
+            selection_info['generation_shortage_reason'] = 'ETKDG embedding failures and/or embedding RMS pruning.'
+        clustering = None  # Keep all candidates; MaxMin replaces Butina, not ETKDG pruning.
 
     # Clustering by RMS or TFD matrix
     if clustering is not None:
@@ -1073,8 +1735,10 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
         if not skip_flag:
             utils.radon_print('Clusters:%s' % str(clusters))
             idx_list = []
+            # RDKit distance matrices follow storage order, not the energy-ranked IDs.
+            conformer_ids = [conf.GetId() for conf in mol_c.GetConformers()]
             for cl in clusters:
-                cl = list(cl)
+                cl = [conformer_ids[index] for index in cl]
                 if len(cl) > 1:
                     idx = min(cl)
                     idx_list.append(idx)
@@ -1104,9 +1768,18 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
     re_energy = np.array(e_res_new)
 
     # DFT optimization of conformers
+    dft_conf_ids = list(range(min(dft_nconf, nconf_new)))
+    if selection is not None:
+        # In this opt-in path, positive dft_nconf enables QM optimization of
+        # every selected conformer. The selection count is controlled by nselect.
+        dft_conf_ids = selected_ids if dft_nconf > 0 else []
+        if dft_nconf > 0:
+            dft_nconf = len(dft_conf_ids)
     if dft_nconf > 0:
         opt_success = 0
         if not qm_avail:
+            if selection is not None:
+                raise RuntimeError('QM optimization requested, but the QM backend is unavailable.')
             utils.radon_print('Cannot import psi4_wrapper. You can use psi4_wrapper by "conda install -c psi4 psi4 resp dftd3"', level=3)
             Chem.SanitizeMol(mol_c)
             return mol_c, re_energy
@@ -1126,8 +1799,11 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
         if (psi4_mp > 0 or const.mpi4py_avail) and dft_nconf > 1:
             utils.picklable(mol_c)
             c = utils.picklable_const()
+            worker_kwargs = dict(kwargs)
+            if selection is not None:
+                worker_kwargs['_check_conformer_failure'] = True
             args = [(mol_c, i, work_dir, tmp_dir, psi4_omp, qm_solver, opt_method, opt_basis, opt_basis_gen, log_name,
-                    geom_iter, geom_conv, geom_algorithm, memory, kwargs, c) for i in range(dft_nconf)]
+                    geom_iter, geom_conv, geom_algorithm, memory, worker_kwargs, c) for i in dft_conf_ids]
 
             # mpi4py
             if const.mpi4py_avail:
@@ -1135,8 +1811,8 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
                 with MPIPoolExecutor(max_workers=psi4_mp) as executor:
                     results = executor.map(_conf_search_psi4_worker, args)
 
-                    for i, res in enumerate(results):
-                        dft_energies.append((res[0], i))
+                    for i, res in zip(dft_conf_ids, results):
+                        dft_results.append((res[0], i, bool(res[2])))
                         coord = res[1]
                         for j, atom in enumerate(psi4mol.mol.GetAtoms()):
                             psi4mol.mol.GetConformer(i).SetAtomPosition(j, Geom.Point3D(coord[j, 0], coord[j, 1], coord[j, 2]))
@@ -1146,12 +1822,12 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
             else:
                 utils.radon_print('Parallel method: concurrent.futures.ProcessPoolExecutor')
                 if psi4_mp == 1:
-                    for i, arg in enumerate(args):
+                    for i, arg in zip(dft_conf_ids, args):
                         with confu.ProcessPoolExecutor(max_workers=psi4_mp, mp_context=MP.get_context('spawn')) as executor:
                             results = executor.map(_conf_search_psi4_worker, [arg])
 
                         for res in results:
-                            dft_energies.append((res[0], i))
+                            dft_results.append((res[0], i, bool(res[2])))
                             coord = res[1]
                             for j, atom in enumerate(psi4mol.mol.GetAtoms()):
                                 psi4mol.mol.GetConformer(i).SetAtomPosition(j, Geom.Point3D(coord[j, 0], coord[j, 1], coord[j, 2]))
@@ -1161,8 +1837,8 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
                     with confu.ProcessPoolExecutor(max_workers=psi4_mp, mp_context=MP.get_context('spawn')) as executor:
                         results = executor.map(_conf_search_psi4_worker, args)
 
-                        for i, res in enumerate(results):
-                            dft_energies.append((res[0], i))
+                        for i, res in zip(dft_conf_ids, results):
+                            dft_results.append((res[0], i, bool(res[2])))
                             coord = res[1]
                             for j, atom in enumerate(psi4mol.mol.GetAtoms()):
                                 psi4mol.mol.GetConformer(i).SetAtomPosition(j, Geom.Point3D(coord[j, 0], coord[j, 1], coord[j, 2]))
@@ -1172,35 +1848,56 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
 
         # Sequential execution of psi4 optimizations
         else:
-            for i in tqdm(range(dft_nconf), desc='[DFT optimization]', disable=const.tqdm_disable):
+            for i in tqdm(dft_conf_ids, desc='[DFT optimization]', disable=const.tqdm_disable):
                 utils.radon_print('DFT optimization of conformer %i' % i)
                 psi4mol.confId = i
                 psi4mol.name = '%s_conf_search_%i' % (log_name, i)
-                energy, _ = psi4mol.optimize(ignore_conv_error=True, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm)
+                psi4mol.error_flag = False
+                try:
+                    energy, _ = psi4mol.optimize(ignore_conv_error=True, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm)
+                except Exception:
+                    if selection is None:
+                        raise
+                    energy, psi4mol.error_flag = np.nan, True
                 if not psi4mol.error_flag:
                     opt_success += 1
-                dft_energies.append((energy, i))
+                dft_results.append((energy, i, bool(psi4mol.error_flag)))
+
+        if selection is not None:
+            return_mol = utils.deepcopy_mol(psi4mol.mol)
+            re_energy = np.full((nconf_new, 2), np.nan)
+            re_energy[:, 1] = e_res_new
+            for energy, cid, _ in dft_results:
+                re_energy[cid, 0] = energy
+            _finish_conformer_selection(return_mol, selection_info, dft_results)
+            Chem.SanitizeMol(return_mol)
+            return return_mol, re_energy
 
         if opt_success == 0:
             utils.radon_print('All conformers were failed to optimize geometry. Return the results of the MM optimization.', level=2)
+            for _, conf_id, _ in dft_results:
+                mol_c.GetConformer(conf_id).SetBoolProp('_RadonPyDFTConverged', False)
             Chem.SanitizeMol(mol_c)
             return mol_c, re_energy
 
         # Sort by DFT energy
         utils.radon_print('Conformer IDs were sorted by DFT energy.')
  
-        dft_energies = np.array(dft_energies)
-        e_dft_res = dft_energies[:, 0]
-        dft_energies = dft_energies[np.argsort(dft_energies[:, 0])]
+        sorted_dft_results = sorted(
+            dft_results,
+            key=lambda result: (not np.isfinite(result[0]), result[0]),
+        )
         re_energy = np.full((len(e_res_new), 2), np.nan, dtype=float)
 
         for i in range(dft_nconf):
             psi4mol.mol.GetConformer(i).SetId(i+nconf_new)
-        for i, cid in enumerate(dft_energies):
-            psi4mol.mol.GetConformer(int(cid[1]+nconf_new)).SetId(i)
-            re_energy[i, 0] = e_dft_res[int(cid[1])]
-            re_energy[i, 1] = e_res_new[int(cid[1])]
-            utils.radon_print('Changing conformer ID %i -> %i' % (int(cid[1]), i))
+        for new_id, (energy, old_id, failed) in enumerate(sorted_dft_results):
+            conformer = psi4mol.mol.GetConformer(old_id+nconf_new)
+            conformer.SetId(new_id)
+            conformer.SetBoolProp('_RadonPyDFTConverged', not failed)
+            re_energy[new_id, 0] = energy
+            re_energy[new_id, 1] = e_res_new[old_id]
+            utils.radon_print('Changing conformer ID %i -> %i' % (old_id, new_id))
         if nconf_new > dft_nconf:
             re_energy[dft_nconf:, 1] = e_res_new[dft_nconf:]
 
@@ -1211,40 +1908,59 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=0, etkdg_ver=2, rmst
         return return_mol, re_energy
 
     else:
+        if selection is not None:
+            _finish_conformer_selection(mol_c, selection_info)
         Chem.SanitizeMol(mol_c)
         return mol_c, re_energy
 
 
 def _conf_search_lammps_worker(args):
-    mol, confId, solver, solver_path, work_dir, omp, mpi, gpu, c = args
+    mol, confId, solver, solver_path, work_dir, omp, mpi, gpu, c = args[:9]
+    check_failure = args[9] if len(args) > 9 else False
     utils.restore_const(c)
 
     utils.radon_print('Worker process %i start on %s. PID: %i' % (confId, socket.gethostname(), os.getpid()))
 
     utils.restore_picklable(mol)
-    mol, energy, coord = md.quick_min(mol, confId=confId, min_style='cg', idx=confId, tmp_clear=True,
-                        solver=solver, solver_path=solver_path, work_dir=work_dir, omp=omp, mpi=mpi, gpu=gpu)
+    try:
+        mol, energy, coord = md.quick_min(mol, confId=confId, min_style='cg', idx=confId, tmp_clear=True,
+                            solver=solver, solver_path=solver_path, work_dir=work_dir, omp=omp, mpi=mpi, gpu=gpu)
+        conf = mol.GetConformer(confId)
+        status = ('converged' if conf.GetBoolProp('_RadonPyMMConverged') else conf.GetProp('_RadonPyMMStatus'))
+    except Exception as exc:
+        if not check_failure:
+            raise
+        energy, coord, status = np.nan, mol.GetConformer(confId).GetPositions(), 'MM failed: %s' % exc
 
     gc.collect()
 
-    return energy, coord
+    return energy, coord, status
 
 
 def _conf_search_rdkit_worker(args):
-    mol, prop, confId, c = args
+    mol, prop, confId, c = args[:4]
+    check_failure = args[4] if len(args) > 4 else False
     utils.restore_const(c)
 
     utils.radon_print('Worker process %i start on %s. PID: %i' % (confId, socket.gethostname(), os.getpid()))
     
     utils.restore_picklable(mol)
-    mmff = AllChem.MMFFGetMoleculeForceField(mol, prop, confId=confId)
-    mmff.Minimize()
-    energy = mmff.CalcEnergy()
-    coord = np.array(mmff.Positions())
+    try:
+        if prop is None:
+            prop = AllChem.MMFFGetMoleculeProperties(mol)
+        mmff = AllChem.MMFFGetMoleculeForceField(mol, prop, confId=confId)
+        status = mmff.Minimize()
+        energy = mmff.CalcEnergy()
+        coord = np.asarray(mmff.Positions()).reshape((-1, 3))
+        reason = 'converged' if status == 0 else 'MM minimization status %s' % status
+    except Exception as exc:
+        if not check_failure:
+            raise
+        energy, coord, reason = np.nan, mol.GetConformer(confId).GetPositions(), 'MM failed: %s' % exc
 
     gc.collect()
 
-    return energy, coord
+    return energy, coord, reason
 
 
 def _conf_search_psi4_worker(args):
@@ -1255,14 +1971,21 @@ def _conf_search_psi4_worker(args):
 
     error_flag = False
     utils.restore_picklable(mol)
+    kwargs = dict(kwargs)
+    check_failure = kwargs.pop('_check_conformer_failure', False)
     psi4mol = QMw(mol, work_dir=work_dir, tmp_dir=tmp_dir, omp=psi4_omp, qm_solver=qm_solver, method=opt_method, basis=opt_basis, basis_gen=opt_basis_gen,
                     memory=memory, **kwargs)
     psi4mol.confId = confId
     psi4mol.name = '%s_conf_search_%i' % (log_name, confId)
     utils.radon_print('DFT optimization of conformer %i' % psi4mol.confId)
 
-    energy, coord = psi4mol.optimize(ignore_conv_error=True, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm)
-    error_flag = psi4mol.error_flag
+    try:
+        energy, coord = psi4mol.optimize(ignore_conv_error=True, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm)
+        error_flag = psi4mol.error_flag
+    except Exception:
+        if not check_failure:
+            raise
+        energy, coord, error_flag = np.nan, mol.GetConformer(confId).GetPositions(), True
 
     del psi4mol
     gc.collect()

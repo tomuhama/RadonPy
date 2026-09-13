@@ -406,6 +406,17 @@ def quick_min(mol, confId=0, min_style='cg', idx=None, tmp_clear=False,
     energy = anal.dfs[-1]['PotEng'].iat[-1]
     uwstr, wstr, _, _, _ = sol.read_traj_simple(os.path.join(sol.work_dir, md.outstr))
 
+    # LAMMPS reports whether a tolerance or a failure/iteration limit stopped CG.
+    # Keep the return tuple unchanged; expose the status on the conformer.
+    stopping = 'unknown MM convergence (no LAMMPS stopping criterion)'
+    with open(os.path.join(sol.work_dir, md.log_file)) as log:
+        for line in log:
+            if 'Stopping criterion =' in line:
+                stopping = line.split('Stopping criterion =', 1)[1].strip()
+    conf = mol_copy.GetConformer(confId)
+    conf.SetBoolProp('_RadonPyMMConverged', stopping in ('energy tolerance', 'force tolerance'))
+    conf.SetProp('_RadonPyMMStatus', stopping)
+
     if tmp_clear: md.clear(work_dir)
 
     return mol_copy, energy, uwstr

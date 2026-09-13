@@ -8,6 +8,8 @@
 
 import numpy as np
 import os
+import copy
+import tempfile
 import gc
 import datetime
 import socket
@@ -32,6 +34,203 @@ if const.mpi4py_avail:
     except ImportError as e:
         utils.radon_print('Cannot import mpi4py. Change to const.mpi4py_avail = False. %s' % e, level=2)
         const.mpi4py_avail = False
+
+
+def _pop_resp_constraints(options, natom):
+    """Remove case variants and return canonical one-based RESP constraints."""
+
+    charge_rows = []
+    equality_groups = []
+    for key in list(options):
+        canonical = key.upper() if isinstance(key, str) else key
+        if canonical not in ('CONSTRAINT_CHARGE', 'CONSTRAINT_GROUP'):
+            continue
+        value = options.pop(key)
+        if canonical == 'CONSTRAINT_CHARGE':
+            charge_rows.extend(value)
+        else:
+            equality_groups.extend(value)
+
+    normalized_rows = []
+    for target, indices in charge_rows:
+        if isinstance(target, (bool, np.bool_)) or not isinstance(target, (int, float, np.integer, np.floating)) \
+                or not np.isfinite(target):
+            raise ValueError('RESP charge-constraint targets must be finite numbers.')
+        if not indices:
+            raise ValueError('RESP charge-constraint groups must not be empty.')
+        normalized_indices = []
+        for atom_idx in indices:
+            if isinstance(atom_idx, (bool, np.bool_)) or not isinstance(atom_idx, (int, np.integer)):
+                raise TypeError('RESP atom indices must be integers (bool is not allowed).')
+            atom_idx = int(atom_idx)
+            if atom_idx < 1 or atom_idx > natom:
+                raise ValueError('A one-based RESP atom index is out of range.')
+            if atom_idx in normalized_indices:
+                raise ValueError('A RESP charge constraint contains a duplicate atom index.')
+            normalized_indices.append(atom_idx)
+        normalized_rows.append([float(target), normalized_indices])
+
+    normalized_equality_groups = []
+    for group in equality_groups:
+        if not group:
+            raise ValueError('RESP equality groups must not be empty.')
+        normalized_group = []
+        for atom_idx in group:
+            if isinstance(atom_idx, (bool, np.bool_)) or not isinstance(atom_idx, (int, np.integer)):
+                raise TypeError('RESP equality-group indices must be integers (bool is not allowed).')
+            atom_idx = int(atom_idx)
+            if atom_idx < 1 or atom_idx > natom:
+                raise ValueError('A one-based RESP equality-group index is out of range.')
+            if atom_idx in normalized_group:
+                raise ValueError('A RESP equality group contains a duplicate atom index.')
+            normalized_group.append(atom_idx)
+        normalized_equality_groups.append(normalized_group)
+    return normalized_rows, normalized_equality_groups
+
+
+def _constraint_matrix(natom, total_charge, charge_rows, equality_groups):
+    """Build ``A q = b`` for molecular, charge-sum, and equality constraints."""
+
+    constraint_rows = [np.ones(natom, dtype=float)]
+    target_values = [float(total_charge)]
+    for target, indices in charge_rows:
+        row = np.zeros(natom, dtype=float)
+        row[np.asarray(indices, dtype=int) - 1] = 1.0
+        constraint_rows.append(row)
+        target_values.append(float(target))
+    for group in equality_groups:
+        for previous, current in zip(group, group[1:]):
+            row = np.zeros(natom, dtype=float)
+            row[previous - 1] = -1.0
+            row[current - 1] = 1.0
+            constraint_rows.append(row)
+            target_values.append(0.0)
+    return np.asarray(constraint_rows, dtype=float), np.asarray(target_values, dtype=float)
+
+
+def _validate_constraint_system(natom, total_charge, charge_rows, equality_groups, tolerance):
+    """Reject an inconsistent RESP constraint system before running Psi4."""
+
+    matrix, rhs = _constraint_matrix(
+        natom, total_charge, charge_rows, equality_groups
+    )
+    rank = np.linalg.matrix_rank(matrix)
+    augmented_rank = np.linalg.matrix_rank(np.column_stack((matrix, rhs)))
+    fitted_solution = np.linalg.lstsq(matrix, rhs, rcond=None)[0]
+    residual = np.max(np.abs(matrix.dot(fitted_solution) - rhs))
+    if augmented_rank > rank or residual > tolerance:
+        raise ValueError('RESP charge constraints are mutually inconsistent.')
+
+
+def _merge_public_constraints(
+        natom, total_charge, charge_rows, equality_groups, public_constraints, tolerance):
+    """Merge zero-based public constraints into one-based RESP charge rows.
+
+    Stage 2 fixes many atom charges individually.  Their contributions are
+    moved to the right-hand side before a public charge-sum row is added.
+    Dependent, consistent rows are omitted instead of making RESP singular.
+    """
+
+    merged_rows = [[float(target), list(indices)] for target, indices in charge_rows]
+    fixed_charges = {}
+    for target, indices in merged_rows:
+        if len(indices) == 1:
+            atom_idx = indices[0]
+            if atom_idx in fixed_charges and abs(fixed_charges[atom_idx] - target) > tolerance:
+                raise ValueError('RESP stage-2 fixed-atom constraints are inconsistent.')
+            fixed_charges[atom_idx] = target
+
+    _validate_constraint_system(
+        natom, total_charge, merged_rows, equality_groups, tolerance
+    )
+    for target, zero_based_indices in public_constraints:
+        one_based_indices = [atom_idx + 1 for atom_idx in zero_based_indices]
+        fitted_indices = [
+            atom_idx for atom_idx in one_based_indices
+            if atom_idx not in fixed_charges
+        ]
+        fixed_contribution = sum(
+            fixed_charges[atom_idx]
+            for atom_idx in one_based_indices
+            if atom_idx in fixed_charges
+        )
+        fitted_target = float(target) - fixed_contribution
+        if not fitted_indices:
+            if abs(fitted_target) > tolerance:
+                raise ValueError('Fixed RESP stage-2 charges conflict with a public charge constraint.')
+            continue
+
+        candidate_row = [fitted_target, fitted_indices]
+        base_matrix, _ = _constraint_matrix(
+            natom, total_charge, merged_rows, equality_groups
+        )
+        candidate_matrix, candidate_rhs = _constraint_matrix(
+            natom, total_charge, merged_rows + [candidate_row], equality_groups
+        )
+        base_rank = np.linalg.matrix_rank(base_matrix)
+        candidate_rank = np.linalg.matrix_rank(candidate_matrix)
+        if candidate_rank == base_rank:
+            augmented_rank = np.linalg.matrix_rank(
+                np.column_stack((candidate_matrix, candidate_rhs))
+            )
+            if augmented_rank > candidate_rank:
+                raise ValueError('A dependent RESP charge constraint has an inconsistent target.')
+            fitted_solution = np.linalg.lstsq(candidate_matrix, candidate_rhs, rcond=None)[0]
+            maximum_residual = np.max(
+                np.abs(candidate_matrix.dot(fitted_solution) - candidate_rhs)
+            )
+            if maximum_residual > tolerance:
+                raise ValueError('A dependent RESP charge constraint has an inconsistent target.')
+            continue
+        merged_rows.append(candidate_row)
+        _validate_constraint_system(
+            natom, total_charge, merged_rows, equality_groups, tolerance
+        )
+    return merged_rows
+
+
+def _topological_stage2_constraints(mol, stage1_charges):
+    """Generate the RESP helper's C-H groups from RDKit bonds, not distances."""
+
+    refitted_atom_indices = set()
+    equality_groups = []
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() != 6 or atom.GetDegree() != 4:
+            continue
+        hydrogens = [
+            neighbor.GetIdx() + 1
+            for neighbor in atom.GetNeighbors()
+            if neighbor.GetAtomicNum() == 1
+        ]
+        if hydrogens:
+            refitted_atom_indices.add(atom.GetIdx() + 1)
+            refitted_atom_indices.update(hydrogens)
+            equality_groups.append(hydrogens)
+    fixed_charge_rows = [
+        [float(stage1_charges[atom_idx - 1]), [atom_idx]]
+        for atom_idx in range(1, mol.GetNumAtoms() + 1)
+        if atom_idx not in refitted_atom_indices
+    ]
+    return fixed_charge_rows, equality_groups
+
+
+def _validate_charge_vectors(
+        charges, total_charge, charge_rows, equality_groups, public_constraints, tolerance):
+    """Validate both ESP and RESP vectors against all requested constraints."""
+
+    charge_vectors = np.asarray(charges, dtype=float)
+    if charge_vectors.ndim != 2 or charge_vectors.shape[0] < 2 \
+            or not np.all(np.isfinite(charge_vectors)):
+        raise ValueError('RESP returned non-finite or malformed charge vectors.')
+    matrix, rhs = _constraint_matrix(
+        charge_vectors.shape[1], total_charge, charge_rows, equality_groups
+    )
+    for charge_vector in charge_vectors[:2]:
+        if np.max(np.abs(matrix.dot(charge_vector) - rhs)) > tolerance:
+            raise ValueError('RESP charge vector violates a total, fixed, sum, or equality constraint.')
+        for target, indices in public_constraints:
+            if abs(float(np.sum(charge_vector[indices])) - target) > tolerance:
+                raise ValueError('RESP charge vector violates a public charge constraint.')
 
 
 class Psi4w():
@@ -802,7 +1001,8 @@ class Psi4w():
         return charges2[1]
 
 
-    def resp_multi(self, confId_list, weights=None, resp_options=None, **kwargs):
+    def resp_multi(self, confId_list, weights=None, resp_options=None, charge_constraints=None,
+            constraint_tol=1e-6, return_comparison=False, **kwargs):
         """
         Psi4w.resp_multi
 
@@ -815,48 +1015,66 @@ class Psi4w():
             weights: RESP weights in the same order as ``confId_list``. RESP squares each weight when
                 adding a conformer's contribution to the objective function. The weights are passed
                 through without normalization or transformation.
-            resp_options: Additional options passed to the RESP package. These override the
-                RadonPy defaults, except for ``WEIGHT`` which is always taken from ``weights``.
+            resp_options: Additional options passed to RESP; string keys are normalized
+                to uppercase. ``WEIGHT`` comes from ``weights``. ``RESP_A`` applies
+                to stage 1; stage 2 uses 0.001. Set charge-sum constraints through
+                ``charge_constraints``, not ``CONSTRAINT_CHARGE`` in these options.
+            charge_constraints: Zero-based ``(target_charge, atom_indices)`` charge-sum constraints.
+            constraint_tol: Absolute tolerance used for constraint-system and fitted-charge checks.
+            return_comparison: Also fit each conformer independently with weight 1, reusing its ESP.
+                Temporary fit directories isolate upstream output files; no additional QM is run.
 
         Returns:
             Shared RESP charges (float, ndarray). A NaN array is returned on failure.
+            With ``return_comparison=True``, returns ``(charges, comparison)``; comparison
+            contains ``conf_ids``, ``resp_weights``, ``joint_resp``, and ``individual_resp``.
+            Array columns follow RDKit atom order; individual rows follow confId_list.
+            Any failed fit returns ``(NaN array, None)`` without updating atom properties.
         """
 
         failed_charges = np.full(self.mol.GetNumAtoms(), np.nan)
+        failed_result = (failed_charges, None) if return_comparison else failed_charges
+        comparison = None
         self.error_flag = False
 
         if confId_list is None:
             utils.radon_print('confId_list must be explicitly specified for multi-conformer RESP.', level=2)
             self.error_flag = True
-            return failed_charges
+            return failed_result
         if not isinstance(confId_list, (list, tuple)):
             utils.radon_print('confId_list must be a list or tuple for multi-conformer RESP.', level=2)
             self.error_flag = True
-            return failed_charges
+            return failed_result
         if len(confId_list) < 2:
-            utils.radon_print('confId_list must contain at least two conformer IDs for multi-conformer RESP.', level=2)
+            utils.radon_print(
+                'confId_list must contain at least two conformer IDs for multi-conformer RESP.',
+                level=2,
+            )
             self.error_flag = True
-            return failed_charges
+            return failed_result
 
         validated_conf_ids = []
         for conf_id in confId_list:
             if isinstance(conf_id, (bool, np.bool_)) or not isinstance(conf_id, (int, np.integer)):
-                utils.radon_print('Each conformer ID in confId_list must be an integer (bool is not allowed).', level=2)
+                utils.radon_print(
+                    'Each conformer ID in confId_list must be an integer (bool is not allowed).',
+                    level=2,
+                )
                 self.error_flag = True
-                return failed_charges
+                return failed_result
             conf_id = int(conf_id)
             try:
                 self.mol.GetConformer(conf_id)
             except (ValueError, RuntimeError, OverflowError, IndexError):
                 utils.radon_print('Conformer ID %i in confId_list does not exist.' % conf_id, level=2)
                 self.error_flag = True
-                return failed_charges
+                return failed_result
             validated_conf_ids.append(conf_id)
 
         if len(set(validated_conf_ids)) != len(validated_conf_ids):
             utils.radon_print('Duplicate conformer IDs are not allowed in confId_list.', level=2)
             self.error_flag = True
-            return failed_charges
+            return failed_result
 
         if weights is None:
             validated_weights = [1.0] * len(validated_conf_ids)
@@ -864,11 +1082,14 @@ class Psi4w():
             if not isinstance(weights, (list, tuple)):
                 utils.radon_print('weights must be a list or tuple for multi-conformer RESP.', level=2)
                 self.error_flag = True
-                return failed_charges
+                return failed_result
             if len(weights) != len(validated_conf_ids):
-                utils.radon_print('weights must have the same length as confId_list for multi-conformer RESP.', level=2)
+                utils.radon_print(
+                    'weights must have the same length as confId_list for multi-conformer RESP.',
+                    level=2,
+                )
                 self.error_flag = True
-                return failed_charges
+                return failed_result
 
             validated_weights = []
             for weight in weights:
@@ -877,26 +1098,42 @@ class Psi4w():
                 except (TypeError, ValueError, OverflowError):
                     utils.radon_print('Each multi-conformer RESP weight must be convertible to float.', level=2)
                     self.error_flag = True
-                    return failed_charges
-                if not np.isfinite(weight):
-                    utils.radon_print('Each multi-conformer RESP weight must be finite.', level=2)
+                    return failed_result
+                if not np.isfinite(weight) or weight <= 0.0:
+                    utils.radon_print(
+                        'Each multi-conformer RESP weight must be finite and strictly positive.',
+                        level=2,
+                    )
                     self.error_flag = True
-                    return failed_charges
-                if weight < 0.0:
-                    utils.radon_print('Multi-conformer RESP weights must not be negative.', level=2)
-                    self.error_flag = True
-                    return failed_charges
+                    return failed_result
                 validated_weights.append(weight)
-
-            if not any(weight > 0.0 for weight in validated_weights):
-                utils.radon_print('At least one multi-conformer RESP weight must be positive.', level=2)
-                self.error_flag = True
-                return failed_charges
 
         if resp_options is not None and not isinstance(resp_options, dict):
             utils.radon_print('resp_options must be a dictionary for multi-conformer RESP.', level=2)
             self.error_flag = True
-            return failed_charges
+            return failed_result
+        if any(isinstance(key, str) and key.upper() == 'CONSTRAINT_CHARGE'
+                for key in (resp_options or {})):
+            utils.radon_print(
+                'Use charge_constraints with zero-based atom indices instead of '
+                'CONSTRAINT_CHARGE in resp_options.', level=2,
+            )
+            self.error_flag = True
+            return failed_result
+        try:
+            validated_constraints = calc.validate_charge_constraints(charge_constraints, self.mol.GetNumAtoms())
+        except (TypeError, ValueError) as e:
+            utils.radon_print(str(e), level=2)
+            self.error_flag = True
+            return failed_result
+        if isinstance(constraint_tol, (bool, np.bool_)) \
+                or not isinstance(constraint_tol, (int, float, np.integer, np.floating)) \
+                or not np.isfinite(constraint_tol) \
+                or constraint_tol <= 0.0:
+            utils.radon_print('constraint_tol must be a finite positive number.', level=2)
+            self.error_flag = True
+            return failed_result
+        constraint_tol = float(constraint_tol)
 
         initialized = False
         charges2_array = None
@@ -905,8 +1142,12 @@ class Psi4w():
 
         try:
             resp_code = getattr(resp.resp, '__code__', None)
-            if LooseVersion(resp.__version__) < LooseVersion('0.8') or (resp_code is not None and resp_code.co_argcount != 2):
-                raise RuntimeError('multi-conformer RESP requires RESP 0.8 or later with the two-argument resp(molecules, options) API.')
+            if LooseVersion(resp.__version__) < LooseVersion('0.8') \
+                    or (resp_code is not None and resp_code.co_argcount != 2):
+                raise RuntimeError(
+                    'multi-conformer RESP requires RESP 0.8 or later with the '
+                    'two-argument resp(molecules, options) API.'
+                )
 
             def _new_esp_solve(A, B):                
                 try:
@@ -922,7 +1163,12 @@ class Psi4w():
             resp.espfit.esp_solve = _new_esp_solve
 
             ptab = Chem.GetPeriodicTable()
-            defv_dict = {ptab.GetElementSymbol(n).upper(): ptab.GetDefaultValence(n) if ptab.GetDefaultValence(n) >= 0 else 0 for n in range(1, 119)}
+            defv_dict = {
+                ptab.GetElementSymbol(n).upper(): (
+                    ptab.GetDefaultValence(n) if ptab.GetDefaultValence(n) >= 0 else 0
+                )
+                for n in range(1, 119)
+            }
             psi4.qcdb.parker._expected_bonds = {**defv_dict, **psi4.qcdb.parker._expected_bonds}
 
             self._prepare_psi4()
@@ -941,16 +1187,31 @@ class Psi4w():
             if reference_natom != self.mol.GetNumAtoms() or reference_symbols != source_symbols:
                 raise ValueError('The first Psi4 molecule does not preserve the RDKit atom count and element order.')
             if reference_charge != self.charge or reference_multiplicity != self.multiplicity:
-                raise ValueError('The first Psi4 molecule does not preserve the requested molecular charge and multiplicity.')
+                raise ValueError(
+                    'The first Psi4 molecule does not preserve the requested molecular '
+                    'charge and multiplicity.'
+                )
             for order, pmol in enumerate(pmols[1:], start=1):
                 if pmol.natom() != reference_natom:
-                    raise ValueError('Conformer %i has a different atom count in multi-conformer RESP.' % validated_conf_ids[order])
+                    raise ValueError(
+                        'Conformer %i has a different atom count in multi-conformer RESP.'
+                        % validated_conf_ids[order]
+                    )
                 if [pmol.symbol(i) for i in range(pmol.natom())] != reference_symbols:
-                    raise ValueError('Conformer %i has a different element order in multi-conformer RESP.' % validated_conf_ids[order])
+                    raise ValueError(
+                        'Conformer %i has a different element order in multi-conformer RESP.'
+                        % validated_conf_ids[order]
+                    )
                 if pmol.molecular_charge() != reference_charge:
-                    raise ValueError('Conformer %i has a different molecular charge in multi-conformer RESP.' % validated_conf_ids[order])
+                    raise ValueError(
+                        'Conformer %i has a different molecular charge in multi-conformer RESP.'
+                        % validated_conf_ids[order]
+                    )
                 if pmol.multiplicity() != reference_multiplicity:
-                    raise ValueError('Conformer %i has a different multiplicity in multi-conformer RESP.' % validated_conf_ids[order])
+                    raise ValueError(
+                        'Conformer %i has a different multiplicity in multi-conformer RESP.'
+                        % validated_conf_ids[order]
+                    )
 
             log_path = './%s_psi4_multi_resp.log' % self.name
             self._configure_psi4(output=log_path)
@@ -972,44 +1233,113 @@ class Psi4w():
                        }
             if resp_options is not None:
                 for option_name, option_value in resp_options.items():
-                    if isinstance(option_name, str) and option_name.upper() == 'WEIGHT':
+                    if isinstance(option_name, str):
+                        option_name = option_name.upper()
+                    if option_name == 'WEIGHT':
                         continue
                     options[option_name] = option_value
             # The weights argument is the single source of truth for conformer
             # weights, even if a caller supplies WEIGHT in resp_options.
             options['WEIGHT'] = validated_weights
 
-            utils.radon_print('First stage of multi-conformer RESP charge calculation', level=0)
-            charges1 = resp.resp(pmols, options)
-            charges1_array = np.asarray(charges1, dtype=float)
-            if charges1_array.ndim != 2 or charges1_array.shape[0] < 2 or charges1_array.shape[1] != reference_natom:
-                raise ValueError('First-stage multi-conformer RESP returned an invalid charge array.')
-            if not np.all(np.isfinite(charges1_array)):
-                raise ValueError('First-stage multi-conformer RESP returned non-finite charges.')
+            def fit_two_stage(pmols, options):
+                # Upstream RESP and stage-2 setup must not mutate the next fit.
+                options = copy.deepcopy(options)
+                # Stage 1: combine caller-supplied RESP options with the public
+                # zero-based charge constraints.
+                stage1_charge_rows, stage1_equality_groups = _pop_resp_constraints(
+                    options, reference_natom
+                )
+                stage1_charge_rows = _merge_public_constraints(
+                    reference_natom, reference_charge, stage1_charge_rows, stage1_equality_groups,
+                    validated_constraints, constraint_tol,
+                )
+                options['CONSTRAINT_CHARGE'] = stage1_charge_rows
+                options['CONSTRAINT_GROUP'] = stage1_equality_groups
 
-            resp.stage2_helper.set_stage2_constraint(reference, charges1[1], options)
-            options['RESP_A'] = 0.001
-            options['RADIUS'] = {}
-            options['grid'] = [
-                './%i_%s_grid.dat' % (i + 1, pmol.name())
-                for i, pmol in enumerate(pmols)
-            ]
-            options['esp'] = [
-                './%i_%s_grid_esp.dat' % (i + 1, pmol.name())
-                for i, pmol in enumerate(pmols)
-            ]
-            for path in options['grid'] + options['esp']:
-                if not os.path.isfile(path):
-                    raise FileNotFoundError('Required multi-conformer RESP grid/ESP file is missing: %s' % path)
+                utils.radon_print('First stage of multi-conformer RESP charge calculation', level=0)
+                charges1 = resp.resp(pmols, options)
+                charges1_array = np.asarray(charges1, dtype=float)
+                if charges1_array.ndim != 2 or charges1_array.shape[0] < 2 or charges1_array.shape[1] != reference_natom:
+                    raise ValueError('First-stage multi-conformer RESP returned an invalid charge array.')
+                if not np.all(np.isfinite(charges1_array)):
+                    raise ValueError('First-stage multi-conformer RESP returned non-finite charges.')
+                _validate_charge_vectors(
+                    charges1_array, reference_charge, stage1_charge_rows, stage1_equality_groups,
+                    validated_constraints, constraint_tol,
+                )
+                stage1_resp_charges = charges1_array[1]
 
-            utils.radon_print('Second stage of multi-conformer RESP charge calculation', level=0)
-            psi4.core.set_output_file(log_path, True)
-            charges2 = resp.resp(pmols, options)
-            charges2_array = np.asarray(charges2, dtype=float)
-            if charges2_array.ndim != 2 or charges2_array.shape[0] < 2 or charges2_array.shape[1] != reference_natom:
-                raise ValueError('Second-stage multi-conformer RESP returned an invalid charge array.')
-            if not np.all(np.isfinite(charges2_array)):
-                raise ValueError('Second-stage multi-conformer RESP returned non-finite charges.')
+                # Stage 2: replace distance-derived constraints with RDKit bond topology.
+                _pop_resp_constraints(options, reference_natom)
+                resp.stage2_helper.set_stage2_constraint(pmols[0], stage1_resp_charges, options)
+                _pop_resp_constraints(options, reference_natom)
+                stage2_charge_rows, stage2_equality_groups = _topological_stage2_constraints(
+                    self.mol, stage1_resp_charges
+                )
+                stage2_charge_rows = _merge_public_constraints(
+                    reference_natom, reference_charge, stage2_charge_rows, stage2_equality_groups,
+                    validated_constraints, constraint_tol,
+                )
+                options['CONSTRAINT_CHARGE'] = stage2_charge_rows
+                options['CONSTRAINT_GROUP'] = stage2_equality_groups
+                options['RESP_A'] = 0.001
+                options['RADIUS'] = {}
+                options['GRID'] = [
+                    './%i_%s_grid.dat' % (i + 1, pmol.name())
+                    for i, pmol in enumerate(pmols)
+                ]
+                options['ESP'] = [
+                    './%i_%s_grid_esp.dat' % (i + 1, pmol.name())
+                    for i, pmol in enumerate(pmols)
+                ]
+                for path in options['GRID'] + options['ESP']:
+                    if not os.path.isfile(path):
+                        raise FileNotFoundError('Required multi-conformer RESP grid/ESP file is missing: %s' % path)
+
+                utils.radon_print('Second stage of multi-conformer RESP charge calculation', level=0)
+                psi4.core.set_output_file(log_path, True)
+                charges2 = resp.resp(pmols, options)
+                charges2_array = np.asarray(charges2, dtype=float)
+                if charges2_array.ndim != 2 or charges2_array.shape[0] < 2 or charges2_array.shape[1] != reference_natom:
+                    raise ValueError('Second-stage multi-conformer RESP returned an invalid charge array.')
+                if not np.all(np.isfinite(charges2_array)):
+                    raise ValueError('Second-stage multi-conformer RESP returned non-finite charges.')
+                _validate_charge_vectors(
+                    charges2_array, reference_charge, stage2_charge_rows, stage2_equality_groups,
+                    validated_constraints, constraint_tol,
+                )
+
+                return charges2_array
+
+            charges2_array = fit_two_stage(pmols, options)
+            if return_comparison:
+                joint_dir = os.getcwd()
+                log_path = os.path.abspath(log_path)
+                individual_resp = np.empty((len(pmols), reference_natom))
+                for i, (conf_id, pmol) in enumerate(zip(validated_conf_ids, pmols)):
+                    utils.radon_print('Independent RESP fit for conformer %i' % conf_id, level=0)
+                    single_options = options.copy()
+                    single_options['WEIGHT'] = [1.0]
+                    single_options['GRID'] = [os.path.join(
+                        joint_dir, '%i_%s_grid.dat' % (i + 1, pmol.name())
+                    )]
+                    single_options['ESP'] = [os.path.join(
+                        joint_dir, '%i_%s_grid_esp.dat' % (i + 1, pmol.name())
+                    )]
+                    # RESP always rewrites grid files and results.out in cwd.
+                    with tempfile.TemporaryDirectory(prefix='resp_conf%i_' % conf_id, dir=joint_dir) as fit_dir:
+                        try:
+                            os.chdir(fit_dir)
+                            individual_resp[i] = fit_two_stage([pmol], single_options)[1]
+                        finally:
+                            os.chdir(joint_dir)
+                comparison = {
+                    'conf_ids': list(validated_conf_ids),
+                    'resp_weights': list(validated_weights),
+                    'joint_resp': charges2_array[1].copy(),
+                    'individual_resp': individual_resp,
+                }
 
             dt2 = datetime.datetime.now()
             utils.radon_print('Normal termination of psi4 multi-conformer RESP charge calculation. Elapsed time = %s' % str(dt2-dt1), level=1)
@@ -1031,7 +1361,7 @@ class Psi4w():
                     utils.radon_print('Error while finalizing psi4 multi-conformer RESP calculation. %s' % e, level=2)
 
         if self.error_flag or charges2_array is None:
-            return failed_charges
+            return failed_result
 
         esp_charges = charges2_array[0].copy()
         resp_charges = charges2_array[1].copy()
@@ -1039,7 +1369,7 @@ class Psi4w():
             atom.SetDoubleProp('ESP', esp_charges[i])
             atom.SetDoubleProp('RESP', resp_charges[i])
 
-        return resp_charges
+        return (resp_charges, comparison) if return_comparison else resp_charges
 
 
     def mulliken_charge(self, recalc=False, **kwargs):

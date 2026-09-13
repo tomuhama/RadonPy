@@ -10,18 +10,23 @@ import numpy as np
 import os
 import json
 import gc
+from typing import Dict, Optional, Sequence, Tuple, Union
 from rdkit import Chem
 from rdkit import Geometry as Geom
 from ..core import utils, const, calc
-from .qm_wrapper import QMw
+try:
+    from .qm_wrapper import QMw
+except ImportError:
+    QMw = None
 
 __version__ = '1.0b2'
 
 
-def assign_charges(mol, charge='RESP', confId=0, confId_list=None, weights=None, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
+def assign_charges(mol, charge='RESP', confId=0, opt=True, work_dir=None, tmp_dir=None, log_name='charge', qm_solver='psi4',
     opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO',
     charge_method='HF', charge_basis='6-31G(d)', charge_basis_gen={'Br':'6-31G(d)', 'I': 'lanl2dz'},
-    total_charge=None, total_multiplicity=None, resp_options=None, **kwargs):
+    total_charge=None, total_multiplicity=None, confId_list=None, weights=None, resp_options=None, charge_constraints=None,
+    constraint_tol=1e-6, return_comparison=False, **kwargs):
     """
     sim.qm.assign_charges
 
@@ -37,8 +42,14 @@ def assign_charges(mol, charge='RESP', confId=0, confId_list=None, weights=None,
         confId: Target conformer ID (int). ``RESP`` uses only this conformer.
         confId_list: Ordered list of RDKit conformer IDs used by ``multi-conformer RESP`` (list or tuple).
         weights: RESP weights in the same order as ``confId_list`` (list or tuple). The upstream RESP package
-            squares each weight when adding a conformer's contribution to the objective function.
+            squares each weight when adding a conformer's contribution to the objective function. Every weight
+            must be finite and strictly positive.
         resp_options: Additional options passed to RESP for ``multi-conformer RESP`` (dict, optional).
+            String keys are normalized to uppercase. ``RESP_A`` sets stage 1 only;
+            stage 2 uses 0.001. Use ``charge_constraints`` for charge-sum constraints.
+        charge_constraints: Zero-based ``(target_charge, atom_indices)`` constraints for multi-conformer RESP.
+        return_comparison: Also fit each conformer independently using the same ESP (multi-conformer RESP only).
+            Individual fits use weight 1 and their own stage-1 charges for stage-2 constraints.
         opt: Do optimization (boolean). ``multi-conformer RESP`` requires pre-optimized conformers and ``opt=False``;
             optimize them first with :func:`conformation_search` or a similar procedure.
         work_dir: Work directory path (str)
@@ -52,26 +63,93 @@ def assign_charges(mol, charge='RESP', confId=0, confId_list=None, weights=None,
         charge_basis_gen: Using basis set in the charge calculation for each element
 
     Returns:
-        boolean
+        boolean by default. With ``return_comparison=True``, returns ``(success, comparison)``;
+        ``comparison`` is None on failure, otherwise a dict with ``conf_ids``, ``resp_weights``,
+        ``joint_resp`` (natoms,), and ``individual_resp`` (nconf, natoms), in RDKit atom order.
+        AtomicCharge always uses the joint fit.
     """
     flag = calc.assign_charges(mol, charge=charge, confId=confId, confId_list=confId_list, weights=weights, resp_options=resp_options,
+            charge_constraints=charge_constraints, constraint_tol=constraint_tol, return_comparison=return_comparison,
             opt=opt, work_dir=work_dir, tmp_dir=tmp_dir, log_name=log_name, qm_solver=qm_solver,
             opt_method=opt_method, opt_basis=opt_basis, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm,
             charge_method=charge_method, charge_basis=charge_basis, charge_basis_gen=charge_basis_gen,
             total_charge=total_charge, total_multiplicity=total_multiplicity, **kwargs)
 
     return flag
+
+
+def assign_charges_from_oligomer(psmiles: str, oligomer_n: int = 3, terminal: str = 'H',
+        tacticity: str = 'isotactic', random_seed: Optional[int] = None,
+        unit_charge: Union[str, float] = 'formal', enforce_unit_charge: bool = True,
+        resp_conf_ids: Optional[Sequence[int]] = None,
+        resp_weights: Optional[Sequence[float]] = None,
+        conformer_search_kwargs: Optional[dict] = None, resp_kwargs: Optional[dict] = None,
+        return_result: bool = False, return_comparison: bool = False) -> Union[Chem.Mol, Tuple[Chem.Mol, Dict[str, object]]]:
+    """Derive one repeating unit's charges from full-oligomer conformers.
+
+    Multi-conformer RESP averages conformations of one fixed oligomer
+    stereosequence. It does not average distinct stereosequences.
+
+    Args:
+        psmiles: Connected, two-linker homopolymer PSMILES.
+        oligomer_n: Odd oligomer length greater than or equal to three.
+        terminal: Terminal cap mode. Only ``'H'`` is currently supported.
+        tacticity: ``'isotactic'`` or a seeded ``'atactic'`` sequence.
+        random_seed: Seed used for tacticity and conformer generation. If None,
+            generate a positive random seed and record it in the charge metadata.
+        unit_charge: ``'formal'`` or a numeric repeat-unit charge target.
+        enforce_unit_charge: Apply the repeat-unit target in both RESP stages.
+        resp_conf_ids: DFT-converged conformer IDs, or all successes by default.
+        resp_weights: Strictly positive RESP weights in conformer-ID order.
+        conformer_search_kwargs: Extra options for :func:`conformation_search`.
+            Defaults to ``dft_nconf=4``. With ``selection='maxmin'``, defaults
+            to 1000 ETKDGv2 requests, no embedding pruning, 8 picks and QM
+            optimization of those picks. Use ``dft_nconf=0`` for MM geometries;
+            QM single-point ESP is still required. See core.calc for metadata
+            and the pre-QM interpretation of resp_conf_ids/resp_weights.
+        resp_kwargs: Extra options for :func:`assign_charges`.
+        return_result: Return diagnostics together with the charged repeat.
+        return_comparison: Also return independent two-stage RESP fits from the same ESP.
+            Implies ``return_result=True``; all atom charges are for the full oligomer.
+
+    Returns:
+        A charged repeating-unit ``Mol``. When either return flag is True, returns
+        ``(charged_repeat, data)`` with the oligomer and diagnostics in ``data``.
+        Comparison mode adds ``data["comparison"]`` (see :func:`assign_charges`) and
+        ``data["center_atom_indices"]`` in repeating-unit atom order, excluding linkers.
+        Any RESP failure raises RuntimeError before transferring charges.
+    """
+    return calc.assign_charges_from_oligomer(
+        psmiles,
+        oligomer_n=oligomer_n,
+        terminal=terminal,
+        tacticity=tacticity,
+        random_seed=random_seed,
+        unit_charge=unit_charge,
+        enforce_unit_charge=enforce_unit_charge,
+        resp_conf_ids=resp_conf_ids,
+        resp_weights=resp_weights,
+        conformer_search_kwargs=conformer_search_kwargs,
+        resp_kwargs=resp_kwargs,
+        return_result=return_result,
+        return_comparison=return_comparison,
+    )
         
 
 def conformation_search(mol, ff=None, nconf=1000, dft_nconf=4, etkdg_ver=2, rmsthresh=0.5, tfdthresh=0.02, clustering='TFD', qm_solver='psi4',
     opt_method='wb97m-d3bj', opt_basis='6-31G(d,p)', opt_basis_gen={'Br': '6-31G(d,p)', 'I': 'lanl2dz'},
     geom_iter=50, geom_conv='QCHEM', geom_algorithm='RFO', log_name='mol', solver='lammps', solver_path=None, work_dir=None, tmp_dir=None,
-    etkdg_omp=-1, psi4_omp=-1, psi4_mp=0, omp=1, mpi=-1, gpu=0, mm_mp=0, memory=1000, total_charge=None, total_multiplicity=None, **kwargs):
+    etkdg_omp=-1, psi4_omp=-1, psi4_mp=0, omp=1, mpi=-1, gpu=0, mm_mp=0, memory=1000, total_charge=None, total_multiplicity=None,
+    random_seed=None, selection=None, nselect=8, distance='tfd', energy_window=None, **kwargs):
     """
     sim.qm.conformation_search
 
     Conformation search
     This is wrapper function of core.calc.conformation_search
+    selection='maxmin' enables TFD/MaxMin (nselect=8, distance='tfd',
+    energy_window=None in kcal/mol); dft_nconf=0 keeps MM coordinates,
+    while a positive dft_nconf optimizes all picks. See core.calc for
+    ID/energy correspondence and _RadonPyConformerSelection metadata.
 
     Args:
         mol: RDKit Mol object
@@ -98,14 +176,15 @@ def conformation_search(mol, ff=None, nconf=1000, dft_nconf=4, etkdg_ver=2, rmst
         RDKit Mol object
         DFT and MM energy (ndarray, kcal/mol)
     """
-    mol, energy = calc.conformation_search(mol, ff=ff, nconf=nconf, dft_nconf=dft_nconf, etkdg_ver=etkdg_ver, rmsthresh=rmsthresh, qm_solver=qm_solver,
+    result = calc.conformation_search(mol, ff=ff, nconf=nconf, dft_nconf=dft_nconf, etkdg_ver=etkdg_ver, rmsthresh=rmsthresh, qm_solver=qm_solver,
                 tfdthresh=tfdthresh, clustering=clustering, opt_method=opt_method, opt_basis=opt_basis,
                 opt_basis_gen=opt_basis_gen, geom_iter=geom_iter, geom_conv=geom_conv, geom_algorithm=geom_algorithm, log_name=log_name,
                 solver=solver, solver_path=solver_path, work_dir=work_dir, tmp_dir=tmp_dir,
                 etkdg_omp=etkdg_omp, psi4_omp=psi4_omp, psi4_mp=psi4_mp, omp=omp, mpi=mpi, gpu=gpu, mm_mp=mm_mp, memory=memory,
-                total_charge=total_charge, total_multiplicity=total_multiplicity, **kwargs)
+                total_charge=total_charge, total_multiplicity=total_multiplicity, random_seed=random_seed,
+                selection=selection, nselect=nselect, distance=distance, energy_window=energy_window, **kwargs)
 
-    return mol, energy
+    return result
 
 
 def sp_prop(mol, confId=0, opt=True, work_dir=None, tmp_dir=None, log_name='sp_prop', qm_solver='psi4',
